@@ -699,7 +699,7 @@ def get_places_keyboard(available_places: List[int]) -> InlineKeyboardMarkup:
 
     for i, place_id in enumerate(available_places):
         row.append(InlineKeyboardButton(
-            text=f"{place_id}️⃣ Место №{place_id}",
+            text=f"Место №{place_id}",
             callback_data=f"place_{place_id}"
         ))
 
@@ -1004,13 +1004,29 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
 
         elif current_state == "ChangeStates:waiting_for_new_place":
             new_date = data.get('booking_date')
+            old_booking_id = data.get('old_booking_id')
             await state.update_data(new_place_id=place_id)
 
-            await callback.message.answer(
-                f"✅ Новая бронь: Место №{place_id} на {new_date}.\n\n"
-                "Подтвердить изменение?",
-                reply_markup=get_confirmation_keyboard()
-            )
+            # Получаем информацию о старой брони
+            old_booking = db.get_booking_by_id(old_booking_id)
+
+            if old_booking:
+                await callback.message.answer(
+                    f"🔄 <b>Изменение брони</b>\n\n"
+                    f"Меняем:\n"
+                    f"📍 <s>{old_booking['place_name']} на {old_booking['date']}</s>\n\n"
+                    f"На:\n"
+                    f"✅ Место №{place_id} на {new_date}\n\n"
+                    f"Подтвердить изменение?",
+                    reply_markup=get_confirmation_keyboard(),
+                    parse_mode="HTML"
+                )
+            else:
+                await callback.message.answer(
+                    f"✅ Новая бронь: Место №{place_id} на {new_date}.\n\n"
+                    "Подтвердить изменение?",
+                    reply_markup=get_confirmation_keyboard()
+                )
 
             await state.set_state(ChangeStates.confirming_change)
 
@@ -1151,6 +1167,18 @@ async def change_selection(callback: CallbackQuery, state: FSMContext):
                 await state.set_state(BookingStates.waiting_for_place)
             else:
                 await state.set_state("AdminStates:booking_for_user_place")
+
+        elif current_state == "ChangeStates:confirming_change":
+            # Возврат к выбору нового места
+            new_date = data.get('booking_date')
+            available_places = db.get_available_places(new_date)
+
+            await callback.message.answer(
+                f"Выберите другое место на {new_date}:",
+                reply_markup=get_places_keyboard(available_places)
+            )
+
+            await state.set_state(ChangeStates.waiting_for_new_place)
 
         await callback.answer()
     except Exception as e:
