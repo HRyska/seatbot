@@ -1579,13 +1579,72 @@ async def admin_show_all_bookings(callback: CallbackQuery):
         await callback.answer()
         return
 
-    text = "📋 <b>Все активные брони:</b>\n\n"
-    for booking in bookings:
-        user_display = f"@{booking['username']}" if booking['username'] else booking['first_name']
-        text += (f"• ID {booking['id']}: <b>{booking['place_name']}</b> на {booking['date']}\n"
-                 f"  Пользователь: {user_display} (ID: {booking['user_id']})\n\n")
+    # Группируем брони по пользователям
+    from collections import defaultdict
+    bookings_by_user = defaultdict(list)
 
-    await callback.message.answer(text, parse_mode="HTML")
+    for booking in bookings:
+        bookings_by_user[booking['user_id']].append(booking)
+
+    # Формируем текст порциями
+    messages = []
+    current_message = "📋 <b>Все активные брони:</b>\n\n"
+    total_users = len(bookings_by_user)
+    total_bookings = len(bookings)
+
+    for user_id, user_bookings in bookings_by_user.items():
+        # Берём имя пользователя из первой брони
+        first_booking = user_bookings[0]
+        user_display = f"@{first_booking['username']}" if first_booking['username'] else first_booking['first_name']
+
+        # Подсчитываем количество броней
+        booking_count = len(user_bookings)
+        booking_word = "бронь" if booking_count == 1 else ("брони" if 2 <= booking_count <= 4 else "броней")
+
+        user_header = f"👤 {user_display} ({booking_count} {booking_word})\n  "
+
+        # Формируем список броней в одну строку
+        booking_items = []
+        for booking in sorted(user_bookings, key=lambda x: x['date']):
+            # Короткая дата (ДД.ММ)
+            date_parts = booking['date'].split('.')
+            short_date = f"{date_parts[0]}.{date_parts[1]}"
+
+            # Номер места
+            place_num = booking['place_id']
+
+            # Добавляем значок для постоянной брони
+            perm_marker = " 📌" if booking.get('booking_type') == 'permanent' else ""
+
+            booking_items.append(f"{short_date} → №{place_num}{perm_marker}")
+
+        bookings_line = ", ".join(booking_items)
+        user_block = user_header + bookings_line + "\n\n"
+
+        # Проверяем, не превысит ли добавление нового пользователя лимит
+        if len(current_message + user_block) > 3800:
+            messages.append(current_message)
+            current_message = "📋 <b>Все активные брони (продолжение):</b>\n\n"
+
+        current_message += user_block
+
+    # Добавляем итоговую статистику
+    footer = f"━━━━━━━━━━━━━━━━━━━\n📊 {total_users} пользователя • {total_bookings} броней"
+
+    if len(current_message + footer) > 3800:
+        messages.append(current_message)
+        current_message = footer
+    else:
+        current_message += footer
+
+    # Добавляем последнее сообщение
+    if current_message.strip():
+        messages.append(current_message)
+
+    # Отправляем все части
+    for msg in messages:
+        await callback.message.answer(msg, parse_mode="HTML")
+
     await callback.answer()
 
 
