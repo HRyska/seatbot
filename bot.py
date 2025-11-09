@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import os
 import calendar
@@ -76,7 +76,17 @@ class AdminStates(StatesGroup):
     change_for_user_confirm = State()
     adding_admin = State()
     removing_admin = State()
-    waiting_for_map_photo = State()  # Новое состояние для загрузки карты
+    waiting_for_map_photo = State()
+    # Постоянные брони
+    permanent_user_id = State()
+    permanent_place_id = State()
+    permanent_days = State()
+    permanent_confirm = State()
+    # Просмотр постоянных броней
+    view_permanent_user = State()
+    # Удаление постоянной брони
+    delete_permanent_user = State()
+    delete_permanent_select = State()
 
 
 # База данных
@@ -116,11 +126,43 @@ class Database:
                     place_id INTEGER NOT NULL,
                     booking_date DATE NOT NULL,
                     status TEXT DEFAULT 'active',
+                    booking_type TEXT DEFAULT 'regular',
+                    permanent_booking_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(telegram_id),
-                    FOREIGN KEY (place_id) REFERENCES places(id)
+                    FOREIGN KEY (place_id) REFERENCES places(id),
+                    FOREIGN KEY (permanent_booking_id) REFERENCES permanent_bookings(id)
                 )
             """)
+
+            # Таблица для постоянных броней
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS permanent_bookings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    place_id INTEGER NOT NULL,
+                    weekdays TEXT NOT NULL,
+                    status TEXT DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_by INTEGER NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(telegram_id),
+                    FOREIGN KEY (place_id) REFERENCES places(id),
+                    FOREIGN KEY (created_by) REFERENCES users(telegram_id)
+                )
+            """)
+
+            # МИГРАЦИЯ: Добавляем новые колонки если их нет
+            try:
+                cursor.execute("SELECT booking_type FROM bookings LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating database: adding booking_type column")
+                cursor.execute("ALTER TABLE bookings ADD COLUMN booking_type TEXT DEFAULT 'regular'")
+
+            try:
+                cursor.execute("SELECT permanent_booking_id FROM bookings LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("Migrating database: adding permanent_booking_id column")
+                cursor.execute("ALTER TABLE bookings ADD COLUMN permanent_booking_id INTEGER")
 
             cursor.execute("SELECT COUNT(*) FROM places")
             if cursor.fetchone()[0] == 0:
@@ -155,19 +197,30 @@ class Database:
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
+
+            # Получаем занятые места из обычных броней
             cursor.execute("""
                 SELECT place_id FROM bookings
                 WHERE booking_date = ? AND status = 'active'
             """, (date,))
             booked = [row[0] for row in cursor.fetchall()]
 
+            # Получаем занятые места из постоянных броней (на этот день недели)
+            cursor.execute("""
+                SELECT place_id FROM permanent_bookings
+                WHERE status = 'active' AND weekdays LIKE ?
+            """, (f'%{weekday}%',))
+            permanent_booked = [row[0] for row in cursor.fetchall()]
+
         available = []
         for place_id in range(1, TOTAL_PLACES + 1):
+            # Проверяем старые PERMANENT_BOOKINGS (хардкод в коде)
             if place_id in PERMANENT_BOOKINGS:
                 if weekday in PERMANENT_BOOKINGS[place_id]:
                     continue
 
-            if place_id not in booked:
+            # Проверяем занятость
+            if place_id not in booked and place_id not in permanent_booked:
                 available.append(place_id)
 
         return available
@@ -206,7 +259,7 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT b.id, b.place_id, b.booking_date, p.name
+                SELECT b.id, b.place_id, b.booking_date, p.name, b.booking_type, b.permanent_booking_id
                 FROM bookings b
                 JOIN places p ON b.place_id = p.id
                 WHERE b.user_id = ? AND b.status = 'active'
@@ -215,11 +268,14 @@ class Database:
 
             bookings = []
             for row in cursor.fetchall():
+                booking_type = row[4] if row[4] else 'regular'
                 bookings.append({
                     'id': row[0],
                     'place_id': row[1],
                     'date': row[2],
-                    'place_name': row[3]
+                    'place_name': row[3],
+                    'booking_type': booking_type,
+                    'permanent_booking_id': row[5]
                 })
             return bookings
 
@@ -281,15 +337,29 @@ class Database:
             return bookings
 
     def cancel_all_bookings(self) -> int:
+        """Отменить все обычные брони и постоянные брони"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+
+            # Отменяем все обычные брони
             cursor.execute("""
                 UPDATE bookings
                 SET status = 'cancelled'
                 WHERE status = 'active'
             """)
+            bookings_count = cursor.rowcount
+
+            # Отменяем все постоянные брони
+            cursor.execute("""
+                UPDATE permanent_bookings
+                SET status = 'deleted'
+                WHERE status = 'active'
+            """)
+            permanent_count = cursor.rowcount
+
             conn.commit()
-            return cursor.rowcount
+            logger.info(f"Cancelled {bookings_count} bookings and {permanent_count} permanent bookings")
+            return bookings_count + permanent_count
 
     def find_user_by_username(self, username: str) -> Optional[int]:
         username = username.lstrip('@').lower()
@@ -334,6 +404,194 @@ class Database:
                 return True
             except:
                 return False
+
+    def create_permanent_booking(self, admin_id: int, user_id: int, place_id: int, weekdays: List[int]) -> bool:
+        """Создать постоянную бронь"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                # Проверяем, нет ли уже постоянной брони на это место + эти дни у ЛЮБОГО пользователя
+                cursor.execute("""
+                    SELECT id, user_id, weekdays FROM permanent_bookings
+                    WHERE place_id = ? AND status = 'active'
+                """, (place_id,))
+
+                existing = cursor.fetchall()
+                for existing_id, existing_user_id, existing_weekdays_str in existing:
+                    existing_weekdays = [int(d) for d in existing_weekdays_str.split(',')]
+                    # Проверяем пересечение дней
+                    if any(day in existing_weekdays for day in weekdays):
+                        logger.error(
+                            f"Permanent booking conflict: place {place_id} already booked by user {existing_user_id} on overlapping days")
+                        return False
+
+                # Проверяем, нет ли уже такой постоянной брони у этого пользователя
+                cursor.execute("""
+                    SELECT id FROM permanent_bookings
+                    WHERE user_id = ? AND place_id = ? AND status = 'active'
+                """, (user_id, place_id))
+
+                if cursor.fetchone():
+                    logger.error(f"Permanent booking already exists for user {user_id} place {place_id}")
+                    return False
+
+                # Сохраняем постоянную бронь
+                cursor.execute("""
+                    INSERT INTO permanent_bookings (user_id, place_id, weekdays, created_by, status)
+                    VALUES (?, ?, ?, ?, 'active')
+                """, (user_id, place_id, ','.join(map(str, weekdays)), admin_id))
+
+                permanent_id = cursor.lastrowid
+
+                # Создаём брони на ближайшие 60 дней
+                today = datetime.now().date()
+                created_count = 0
+                for i in range(60):
+                    check_date = today + timedelta(days=i)
+                    if check_date.weekday() in weekdays:
+                        date_str = check_date.strftime("%d.%m.%Y")
+
+                        # Проверяем, нет ли уже брони
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM bookings
+                            WHERE place_id = ? AND booking_date = ? AND status = 'active'
+                        """, (place_id, date_str))
+
+                        if cursor.fetchone()[0] == 0:
+                            cursor.execute("""
+                                INSERT INTO bookings (user_id, place_id, booking_date, status, booking_type, permanent_booking_id)
+                                VALUES (?, ?, ?, 'active', 'permanent', ?)
+                            """, (user_id, place_id, date_str, permanent_id))
+                            created_count += 1
+
+                conn.commit()
+                logger.info(f"Created permanent booking {permanent_id} with {created_count} dates")
+                return True
+            except Exception as e:
+                logger.error(f"Error creating permanent booking: {e}")
+                return False
+
+    def get_permanent_bookings(self, user_id: int = None) -> List[Dict]:
+        """Получить постоянные брони"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if user_id:
+                cursor.execute("""
+                    SELECT pb.id, pb.user_id, u.username, u.first_name, pb.place_id, p.name, pb.weekdays, pb.created_at
+                    FROM permanent_bookings pb
+                    JOIN users u ON pb.user_id = u.telegram_id
+                    JOIN places p ON pb.place_id = p.id
+                    WHERE pb.status = 'active' AND pb.user_id = ?
+                    ORDER BY pb.place_id
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT pb.id, pb.user_id, u.username, u.first_name, pb.place_id, p.name, pb.weekdays, pb.created_at
+                    FROM permanent_bookings pb
+                    JOIN users u ON pb.user_id = u.telegram_id
+                    JOIN places p ON pb.place_id = p.id
+                    WHERE pb.status = 'active'
+                    ORDER BY pb.user_id, pb.place_id
+                """)
+
+            bookings = []
+            for row in cursor.fetchall():
+                weekdays = [int(d) for d in row[6].split(',')]
+                bookings.append({
+                    'id': row[0],
+                    'user_id': row[1],
+                    'username': row[2],
+                    'first_name': row[3],
+                    'place_id': row[4],
+                    'place_name': row[5],
+                    'weekdays': weekdays,
+                    'created_at': row[7]
+                })
+            return bookings
+
+    def delete_permanent_booking(self, permanent_id: int) -> bool:
+        """Удалить постоянную бронь и все связанные будущие брони"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                # Помечаем постоянную бронь как удалённую
+                cursor.execute("""
+                    UPDATE permanent_bookings
+                    SET status = 'deleted'
+                    WHERE id = ?
+                """, (permanent_id,))
+
+                # Удаляем все будущие брони этой постоянной брони
+                today = datetime.now().date().strftime("%d.%m.%Y")
+                cursor.execute("""
+                    UPDATE bookings
+                    SET status = 'cancelled'
+                    WHERE permanent_booking_id = ? 
+                    AND booking_date >= ?
+                    AND status = 'active'
+                """, (permanent_id, today))
+
+                conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error deleting permanent booking: {e}")
+                return False
+
+    def cleanup_duplicate_permanent_bookings(self) -> int:
+        """Удалить дублирующиеся постоянные брони (оставить самую свежую)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                # Находим дубли: одинаковые user_id + place_id
+                cursor.execute("""
+                    SELECT user_id, place_id, COUNT(*) as cnt
+                    FROM permanent_bookings
+                    WHERE status = 'active'
+                    GROUP BY user_id, place_id
+                    HAVING cnt > 1
+                """)
+
+                duplicates = cursor.fetchall()
+                deleted_count = 0
+
+                for user_id, place_id, count in duplicates:
+                    # Оставляем только самую новую запись
+                    cursor.execute("""
+                        SELECT id FROM permanent_bookings
+                        WHERE user_id = ? AND place_id = ? AND status = 'active'
+                        ORDER BY created_at DESC
+                    """, (user_id, place_id))
+
+                    all_ids = [row[0] for row in cursor.fetchall()]
+
+                    # Удаляем все кроме первой (самой новой)
+                    ids_to_delete = all_ids[1:]
+
+                    for pb_id in ids_to_delete:
+                        cursor.execute("""
+                            UPDATE permanent_bookings
+                            SET status = 'deleted'
+                            WHERE id = ?
+                        """, (pb_id,))
+
+                        # Удаляем брони, связанные с этой постоянной
+                        today = datetime.now().date().strftime("%d.%m.%Y")
+                        cursor.execute("""
+                            UPDATE bookings
+                            SET status = 'cancelled'
+                            WHERE permanent_booking_id = ? 
+                            AND booking_date >= ?
+                            AND status = 'active'
+                        """, (pb_id, today))
+
+                        deleted_count += 1
+                        logger.info(f"Deleted duplicate permanent booking {pb_id}")
+
+                conn.commit()
+                return deleted_count
+            except Exception as e:
+                logger.error(f"Error cleaning up duplicates: {e}")
+                return 0
 
 
 # Инициализация
@@ -383,11 +641,56 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton(text="🗑️ Отменить бронь пользователя", callback_data="admin_cancel_user")],
         [InlineKeyboardButton(text="➕ Забронировать за пользователя", callback_data="admin_book_for_user")],
         [InlineKeyboardButton(text="🔄 Изменить бронь пользователя", callback_data="admin_change_for_user")],
+        [InlineKeyboardButton(text="📌 Постоянные брони", callback_data="admin_permanent_menu")],
         [InlineKeyboardButton(text="🗺️ Заменить карту офиса", callback_data="admin_change_map")],
         [InlineKeyboardButton(text="👤 Добавить администратора", callback_data="admin_add_admin")],
         [InlineKeyboardButton(text="🗑 Удалить администратора", callback_data="admin_remove_admin")]
     ])
     return keyboard
+
+
+def get_permanent_bookings_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать постоянную бронь", callback_data="admin_create_permanent")],
+        [InlineKeyboardButton(text="📋 Все постоянные брони", callback_data="admin_view_all_permanent")],
+        [InlineKeyboardButton(text="👤 Постоянные брони пользователя", callback_data="admin_view_user_permanent")],
+        [InlineKeyboardButton(text="🗑️ Удалить постоянную бронь", callback_data="admin_delete_permanent")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back_to_main")]
+    ])
+    return keyboard
+
+
+def get_weekday_keyboard(selected: List[int] = None) -> InlineKeyboardMarkup:
+    """Клавиатура выбора дней недели"""
+    if selected is None:
+        selected = []
+
+    weekdays = [
+        ("Пн", 0), ("Вт", 1), ("Ср", 2), ("Чт", 3),
+        ("Пт", 4), ("Сб", 5), ("Вс", 6)
+    ]
+
+    buttons = []
+    row = []
+    for name, num in weekdays:
+        check = "✅" if num in selected else "⬜️"
+        row.append(InlineKeyboardButton(
+            text=f"{check} {name}",
+            callback_data=f"weekday_{num}"
+        ))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(text="✅ Готово", callback_data="weekday_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="weekday_cancel")
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def get_places_keyboard(available_places: List[int]) -> InlineKeyboardMarkup:
@@ -421,8 +724,10 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
 def get_bookings_keyboard(bookings: List[Dict]) -> InlineKeyboardMarkup:
     buttons = []
     for booking in bookings:
+        icon = "📌" if booking.get('booking_type') == 'permanent' else "📅"
+        button_text = f"{icon} {booking['place_name']} - {booking['date']}"
         buttons.append([InlineKeyboardButton(
-            text=f"{booking['place_name']} - {booking['date']}",
+            text=button_text,
             callback_data=f"booking_{booking['id']}"
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -539,7 +844,11 @@ async def show_my_bookings(message: Message):
 
     text = "📅 Ваши активные брони:\n\n"
     for booking in bookings:
-        text += f"• {booking['place_name']} - {booking['date']}\n"
+        booking_icon = "📌" if booking.get('booking_type') == 'permanent' else "•"
+        text += f"{booking_icon} {booking['place_name']} - {booking['date']}"
+        if booking.get('booking_type') == 'permanent':
+            text += " (постоянная)"
+        text += "\n"
 
     await message.answer(text)
 
@@ -981,7 +1290,11 @@ async def admin_cancel_all_execute(callback: CallbackQuery):
         return
 
     count = db.cancel_all_bookings()
-    await callback.message.answer(f"✅ Отменено броней: {count}")
+    await callback.message.answer(
+        f"✅ <b>Отменено записей: {count}</b>\n\n"
+        f"Включая обычные и постоянные брони.",
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 
@@ -1340,6 +1653,358 @@ async def admin_remove_admin_process(message: Message, state: FSMContext):
 async def admin_cancel_action(callback: CallbackQuery):
     await callback.message.delete()
     await callback.answer("Действие отменено")
+
+
+# ПОСТОЯННЫЕ БРОНИ
+@router.callback_query(F.data == "admin_permanent_menu")
+async def admin_permanent_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "📌 <b>Постоянные брони</b>\n\n"
+        "Управление постоянными бронированиями мест.",
+        reply_markup=get_permanent_bookings_menu(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_back_to_main")
+async def admin_back_to_main(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🔑 <b>Админ-панель</b>\n\nВыберите действие:",
+        reply_markup=get_admin_panel_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_create_permanent")
+async def admin_create_permanent_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "➕ <b>Создание постоянной брони</b>\n\n"
+        "Введите Telegram ID или @username пользователя:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.permanent_user_id)
+    await callback.answer()
+
+
+@router.message(AdminStates.permanent_user_id)
+async def admin_permanent_get_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    identifier = message.text.strip()
+
+    try:
+        user_id = int(identifier)
+    except ValueError:
+        user_id = db.find_user_by_username(identifier)
+        if not user_id:
+            await message.answer("❌ Пользователь не найден.")
+            return
+
+    await state.update_data(permanent_user_id=user_id)
+
+    await message.answer(
+        f"👤 Пользователь: ID {user_id}\n\n"
+        "Введите номер места (1-13):",
+    )
+    await state.set_state(AdminStates.permanent_place_id)
+
+
+@router.message(AdminStates.permanent_place_id)
+async def admin_permanent_get_place(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    try:
+        place_id = int(message.text.strip())
+        if place_id < 1 or place_id > TOTAL_PLACES:
+            await message.answer(f"❌ Номер места должен быть от 1 до {TOTAL_PLACES}")
+            return
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 13")
+        return
+
+    await state.update_data(permanent_place_id=place_id)
+
+    await message.answer(
+        f"🪑 Место №{place_id}\n\n"
+        "Выберите дни недели для постоянной брони:",
+        reply_markup=get_weekday_keyboard([])
+    )
+    await state.set_state(AdminStates.permanent_days)
+
+
+@router.callback_query(AdminStates.permanent_days, F.data.startswith("weekday_"))
+async def admin_permanent_toggle_day(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get('selected_weekdays', [])
+
+    action = callback.data.split("_")[1]
+
+    if action == "confirm":
+        if not selected:
+            await callback.answer("⚠️ Выберите хотя бы один день!", show_alert=True)
+            return
+
+        user_id = data.get('permanent_user_id')
+        place_id = data.get('permanent_place_id')
+
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        days_text = ", ".join([weekday_names[d] for d in sorted(selected)])
+
+        await callback.message.edit_text(
+            f"📌 <b>Подтверждение постоянной брони</b>\n\n"
+            f"👤 Пользователь: ID {user_id}\n"
+            f"🪑 Место: №{place_id}\n"
+            f"📅 Дни: {days_text}\n\n"
+            f"Создать постоянную бронь на ближайшие 60 дней?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Создать", callback_data="permanent_create_confirm"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="permanent_create_cancel")
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+        await state.set_state(AdminStates.permanent_confirm)
+        await callback.answer()
+        return
+
+    elif action == "cancel":
+        await callback.message.delete()
+        await callback.answer("Отменено")
+        await state.clear()
+        return
+
+    # Toggle день
+    try:
+        day = int(action)
+        if day in selected:
+            selected.remove(day)
+        else:
+            selected.append(day)
+
+        await state.update_data(selected_weekdays=selected)
+
+        await callback.message.edit_reply_markup(
+            reply_markup=get_weekday_keyboard(selected)
+        )
+        await callback.answer()
+    except:
+        await callback.answer()
+
+
+@router.callback_query(F.data == "permanent_create_confirm")
+async def admin_permanent_create_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    user_id = data.get('permanent_user_id')
+    place_id = data.get('permanent_place_id')
+    weekdays = data.get('selected_weekdays', [])
+
+    success = db.create_permanent_booking(callback.from_user.id, user_id, place_id, weekdays)
+
+    if success:
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        days_text = ", ".join([weekday_names[d] for d in sorted(weekdays)])
+
+        await callback.message.edit_text(
+            f"✅ <b>Постоянная бронь создана!</b>\n\n"
+            f"👤 Пользователь: ID {user_id}\n"
+            f"🪑 Место: №{place_id}\n"
+            f"📅 Дни: {days_text}\n\n"
+            f"Автоматически созданы брони на ближайшие 60 дней.",
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ <b>Ошибка при создании постоянной брони</b>\n\n"
+            "Возможные причины:\n"
+            "• У этого пользователя уже есть постоянная бронь на это место\n"
+            "• Другой пользователь уже забронировал это место на пересекающиеся дни\n"
+            "• Место уже занято на выбранные дни недели\n\n"
+            "Проверьте существующие постоянные брони через меню.",
+            parse_mode="HTML"
+        )
+
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(F.data == "permanent_create_cancel")
+async def admin_permanent_create_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.delete()
+    await callback.answer("Отменено")
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin_view_all_permanent")
+async def admin_view_all_permanent(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    permanent_bookings = db.get_permanent_bookings()
+
+    if not permanent_bookings:
+        await callback.message.answer("📋 Постоянных броней нет.")
+        await callback.answer()
+        return
+
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    text = "📌 <b>Все постоянные брони:</b>\n\n"
+    for pb in permanent_bookings:
+        user_display = f"@{pb['username']}" if pb['username'] else pb['first_name']
+        days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+        text += (f"• ID {pb['id']}: <b>{pb['place_name']}</b>\n"
+                 f"  👤 {user_display} (ID: {pb['user_id']})\n"
+                 f"  📅 {days_text}\n\n")
+
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_view_user_permanent")
+async def admin_view_user_permanent_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "🔍 Введите Telegram ID или @username пользователя:",
+    )
+    await state.set_state(AdminStates.view_permanent_user)
+    await callback.answer()
+
+
+@router.message(AdminStates.view_permanent_user)
+async def admin_view_user_permanent_show(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    identifier = message.text.strip()
+
+    try:
+        user_id = int(identifier)
+    except ValueError:
+        user_id = db.find_user_by_username(identifier)
+        if not user_id:
+            await message.answer("❌ Пользователь не найден.")
+            await state.clear()
+            return
+
+    permanent_bookings = db.get_permanent_bookings(user_id)
+
+    if not permanent_bookings:
+        await message.answer(f"У пользователя {user_id} нет постоянных броней.")
+        await state.clear()
+        return
+
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    text = f"📌 <b>Постоянные брони пользователя {user_id}:</b>\n\n"
+    for pb in permanent_bookings:
+        days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+        text += (f"• ID {pb['id']}: <b>{pb['place_name']}</b>\n"
+                 f"  📅 {days_text}\n\n")
+
+    await message.answer(text, parse_mode="HTML")
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin_delete_permanent")
+async def admin_delete_permanent_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "🗑️ <b>Удаление постоянной брони</b>\n\n"
+        "Введите Telegram ID или @username пользователя:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.delete_permanent_user)
+    await callback.answer()
+
+
+@router.message(AdminStates.delete_permanent_user)
+async def admin_delete_permanent_select(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    identifier = message.text.strip()
+
+    try:
+        user_id = int(identifier)
+    except ValueError:
+        user_id = db.find_user_by_username(identifier)
+        if not user_id:
+            await message.answer("❌ Пользователь не найден.")
+            await state.clear()
+            return
+
+    permanent_bookings = db.get_permanent_bookings(user_id)
+
+    if not permanent_bookings:
+        await message.answer(f"У пользователя {user_id} нет постоянных броней.")
+        await state.clear()
+        return
+
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    buttons = []
+    for pb in permanent_bookings:
+        days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+        buttons.append([InlineKeyboardButton(
+            text=f"{pb['place_name']} ({days_text})",
+            callback_data=f"delete_perm_{pb['id']}"
+        )])
+
+    await message.answer(
+        "Выберите постоянную бронь для удаления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await state.set_state(AdminStates.delete_permanent_select)
+
+
+@router.callback_query(AdminStates.delete_permanent_select, F.data.startswith("delete_perm_"))
+async def admin_delete_permanent_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    permanent_id = int(callback.data.split("_")[2])
+
+    success = db.delete_permanent_booking(permanent_id)
+
+    if success:
+        await callback.message.edit_text(
+            f"✅ Постоянная бронь ID {permanent_id} удалена!\n\n"
+            "Все будущие брони по этому расписанию также отменены."
+        )
+    else:
+        await callback.message.edit_text("❌ Ошибка при удалении.")
+
+    await state.clear()
+    await callback.answer()
 
 
 # Главная функция
