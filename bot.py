@@ -800,6 +800,73 @@ def get_calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_bookings_calendar_keyboard(year: int, month: int, booked_dates: List[str]) -> InlineKeyboardMarkup:
+    """Календарь с выделенными забронированными днями"""
+    buttons = []
+
+    month_name = calendar.month_name[month]
+    buttons.append([InlineKeyboardButton(
+        text=f"📅 {month_name} {year}",
+        callback_data="ignore"
+    )])
+
+    week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    buttons.append([InlineKeyboardButton(text=day, callback_data="ignore") for day in week_days])
+
+    month_calendar = calendar.monthcalendar(year, month)
+
+    for week in month_calendar:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+            else:
+                date = datetime(year, month, day).date()
+                date_str = date.strftime("%d.%m.%Y")
+
+                if date_str in booked_dates:
+                    # День с бронью - в квадратных скобках
+                    row.append(InlineKeyboardButton(
+                        text=f"[{day}]",
+                        callback_data=f"view_booking_{date_str}"
+                    ))
+                else:
+                    # Обычный день - некликабельный
+                    row.append(InlineKeyboardButton(text=str(day), callback_data="ignore"))
+        buttons.append(row)
+
+    # Навигация
+    nav_row = []
+
+    prev_month = month - 1
+    prev_year = year
+    if prev_month < 1:
+        prev_month = 12
+        prev_year -= 1
+
+    nav_row.append(InlineKeyboardButton(
+        text="◀️",
+        callback_data=f"booking_cal_{prev_year}_{prev_month}"
+    ))
+
+    nav_row.append(InlineKeyboardButton(text="❌ Закрыть", callback_data="close_calendar"))
+
+    next_month = month + 1
+    next_year = year
+    if next_month > 12:
+        next_month = 1
+        next_year += 1
+
+    nav_row.append(InlineKeyboardButton(
+        text="▶️",
+        callback_data=f"booking_cal_{next_year}_{next_month}"
+    ))
+
+    buttons.append(nav_row)
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 # Обработчики команд
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -842,15 +909,29 @@ async def show_my_bookings(message: Message):
         await message.answer("У вас нет активных броней.")
         return
 
-    text = "📅 Ваши активные брони:\n\n"
-    for booking in bookings:
-        booking_icon = "📌" if booking.get('booking_type') == 'permanent' else "•"
-        text += f"{booking_icon} {booking['place_name']} - {booking['date']}"
-        if booking.get('booking_type') == 'permanent':
-            text += " (постоянная)"
-        text += "\n"
+    # Если броней 3 или больше - показываем календарь
+    if len(bookings) >= 3:
+        booked_dates = [b['date'] for b in bookings]
+        now = datetime.now()
 
-    await message.answer(text)
+        await message.answer(
+            "📅 <b>Ваши брони</b>\n\n"
+            "Выберите дату для просмотра деталей:\n"
+            "[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+            parse_mode="HTML"
+        )
+    else:
+        # Если броней меньше 3 - показываем список как раньше
+        text = "📅 Ваши активные брони:\n\n"
+        for booking in bookings:
+            booking_icon = "📌" if booking.get('booking_type') == 'permanent' else "•"
+            text += f"{booking_icon} {booking['place_name']} - {booking['date']}"
+            if booking.get('booking_type') == 'permanent':
+                text += " (постоянная)"
+            text += "\n"
+
+        await message.answer(text)
 
 
 @router.message(F.text == "❌ Отменить бронь")
@@ -862,11 +943,26 @@ async def start_cancel(message: Message, state: FSMContext):
         await message.answer("У вас нет активных броней для отмены.")
         return
 
-    await message.answer(
-        "Выберите бронь для отмены:",
-        reply_markup=get_bookings_keyboard(bookings)
-    )
-    await state.set_state(CancelStates.selecting_booking)
+    # Если броней 3 или больше - показываем календарь
+    if len(bookings) >= 3:
+        booked_dates = [b['date'] for b in bookings]
+        now = datetime.now()
+
+        await message.answer(
+            "❌ <b>Отмена брони</b>\n\n"
+            "Выберите дату для отмены:\n"
+            "[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+            parse_mode="HTML"
+        )
+        await state.set_state(CancelStates.selecting_booking)
+    else:
+        # Если броней меньше 3 - показываем список
+        await message.answer(
+            "Выберите бронь для отмены:",
+            reply_markup=get_bookings_keyboard(bookings)
+        )
+        await state.set_state(CancelStates.selecting_booking)
 
 
 @router.message(F.text == "🔁 Поменять бронь")
@@ -878,11 +974,26 @@ async def start_change(message: Message, state: FSMContext):
         await message.answer("У вас нет активных броней для изменения.")
         return
 
-    await message.answer(
-        "Выберите бронь, которую хотите изменить:",
-        reply_markup=get_bookings_keyboard(bookings)
-    )
-    await state.set_state(ChangeStates.selecting_booking)
+    # Если броней 3 или больше - показываем календарь
+    if len(bookings) >= 3:
+        booked_dates = [b['date'] for b in bookings]
+        now = datetime.now()
+
+        await message.answer(
+            "🔁 <b>Изменение брони</b>\n\n"
+            "Выберите дату для изменения:\n"
+            "[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+            parse_mode="HTML"
+        )
+        await state.set_state(ChangeStates.selecting_booking)
+    else:
+        # Если броней меньше 3 - показываем список
+        await message.answer(
+            "Выберите бронь, которую хотите изменить:",
+            reply_markup=get_bookings_keyboard(bookings)
+        )
+        await state.set_state(ChangeStates.selecting_booking)
 
 
 # Обработчики календаря
@@ -912,6 +1023,194 @@ async def cancel_calendar(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer()
+
+
+# Навигация по календарю броней
+@router.callback_query(F.data.startswith("booking_cal_"))
+async def process_bookings_calendar_navigation(callback: CallbackQuery, state: FSMContext):
+    try:
+        _, _, year, month = callback.data.split("_")
+        year = int(year)
+        month = int(month)
+
+        user_id = callback.from_user.id
+        bookings = db.get_user_bookings(user_id)
+        booked_dates = [b['date'] for b in bookings]
+
+        # Определяем текст в зависимости от состояния
+        current_state = await state.get_state()
+        if current_state == "CancelStates:selecting_booking":
+            header = "❌ <b>Отмена брони</b>\n\n"
+        elif current_state == "ChangeStates:selecting_booking":
+            header = "🔁 <b>Изменение брони</b>\n\n"
+        else:
+            header = "📅 <b>Ваши брони</b>\n\n"
+
+        await callback.message.edit_text(
+            header + "Выберите дату для просмотра деталей:\n[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(year, month, booked_dates),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error in bookings calendar navigation: {e}")
+        await callback.answer("Ошибка навигации", show_alert=True)
+
+
+@router.callback_query(F.data == "close_calendar")
+async def close_calendar(callback: CallbackQuery, state: FSMContext):
+    await callback.message.delete()
+    await callback.answer("Закрыто")
+    await state.clear()
+
+
+# Просмотр деталей брони по дате
+@router.callback_query(F.data.startswith("view_booking_"))
+async def view_booking_details(callback: CallbackQuery, state: FSMContext):
+    try:
+        date_str = callback.data.split("view_booking_")[1]
+        user_id = callback.from_user.id
+
+        # Получаем все брони пользователя
+        bookings = db.get_user_bookings(user_id)
+
+        # Находим бронь на эту дату
+        booking = None
+        for b in bookings:
+            if b['date'] == date_str:
+                booking = b
+                break
+
+        if not booking:
+            await callback.answer("Бронь не найдена", show_alert=True)
+            return
+
+        # Определяем текущее состояние для формирования кнопок
+        current_state = await state.get_state()
+
+        # Формируем текст
+        booking_type_text = "Постоянная бронь" if booking.get('booking_type') == 'permanent' else "Обычная бронь"
+        icon = "📌" if booking.get('booking_type') == 'permanent' else "📅"
+
+        text = (
+            f"{icon} <b>Бронь на {date_str}</b>\n\n"
+            f"🪑 Место: {booking['place_name']}\n"
+            f"📅 Дата: {date_str}\n"
+            f"📋 Тип: {booking_type_text}"
+        )
+
+        # Формируем кнопки действий
+        buttons = []
+
+        # Сохраняем ID брони в состояние для дальнейших действий
+        await state.update_data(selected_booking_id=booking['id'])
+
+        # Если мы в процессе отмены - показываем кнопку отмены
+        if current_state == "CancelStates:selecting_booking":
+            buttons.append([InlineKeyboardButton(text="❌ Отменить эту бронь",
+                                                 callback_data=f"confirm_cancel_booking_{booking['id']}")])
+        # Если в процессе изменения - показываем кнопку изменения
+        elif current_state == "ChangeStates:selecting_booking":
+            buttons.append([InlineKeyboardButton(text="🔁 Изменить эту бронь",
+                                                 callback_data=f"confirm_change_booking_{booking['id']}")])
+        # Если просто просмотр - показываем обе кнопки
+        else:
+            buttons.append([
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"confirm_cancel_booking_{booking['id']}"),
+                InlineKeyboardButton(text="🔁 Изменить", callback_data=f"confirm_change_booking_{booking['id']}")
+            ])
+
+        # Кнопка возврата к календарю
+        buttons.append([InlineKeyboardButton(text="◀️ Назад к календарю", callback_data="back_to_bookings_calendar")])
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error viewing booking details: {e}", exc_info=True)
+        await callback.answer("Ошибка при просмотре деталей", show_alert=True)
+
+
+@router.callback_query(F.data == "back_to_bookings_calendar")
+async def back_to_bookings_calendar(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    bookings = db.get_user_bookings(user_id)
+    booked_dates = [b['date'] for b in bookings]
+    now = datetime.now()
+
+    current_state = await state.get_state()
+    if current_state == "CancelStates:selecting_booking":
+        header = "❌ <b>Отмена брони</b>\n\n"
+    elif current_state == "ChangeStates:selecting_booking":
+        header = "🔁 <b>Изменение брони</b>\n\n"
+    else:
+        header = "📅 <b>Ваши брони</b>\n\n"
+
+    await callback.message.edit_text(
+        header + "Выберите дату для просмотра деталей:\n[15] — забронированный день",
+        reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Подтверждение отмены брони из деталей
+@router.callback_query(F.data.startswith("confirm_cancel_booking_"))
+async def confirm_cancel_from_details(callback: CallbackQuery, state: FSMContext):
+    try:
+        booking_id = int(callback.data.split("_")[-1])
+        user_id = callback.from_user.id
+
+        booking = db.get_booking_by_id(booking_id)
+        if not booking:
+            await callback.answer("❌ Бронь не найдена", show_alert=True)
+            return
+
+        success = db.cancel_booking(booking_id, user_id)
+
+        if success:
+            await callback.message.edit_text(
+                f"✅ Бронь {booking['place_name']} на {booking['date']} отменена."
+            )
+        else:
+            await callback.message.edit_text("❌ Ошибка при отмене.")
+
+        await state.clear()
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error canceling booking: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
+
+
+# Начало изменения брони из деталей
+@router.callback_query(F.data.startswith("confirm_change_booking_"))
+async def confirm_change_from_details(callback: CallbackQuery, state: FSMContext):
+    try:
+        booking_id = int(callback.data.split("_")[-1])
+
+        booking = db.get_booking_by_id(booking_id)
+        if not booking:
+            await callback.answer("❌ Бронь не найдена", show_alert=True)
+            return
+
+        await state.update_data(old_booking_id=booking_id)
+
+        now = datetime.now()
+        await callback.message.edit_text(
+            f"Текущая бронь: {booking['place_name']} на {booking['date']}\n\n"
+            "Выберите новую дату:",
+            reply_markup=get_calendar_keyboard(now.year, now.month)
+        )
+
+        await state.set_state(ChangeStates.waiting_for_new_date)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error starting change: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
 
 
 # Обработчики выбора даты
