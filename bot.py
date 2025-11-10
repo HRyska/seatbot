@@ -33,7 +33,7 @@ TOTAL_PLACES = 13
 # ID главного администратора ("мама бота")
 SUPER_ADMIN_ID = 528599224
 
-# ID администраторов
+# ID администраторов (загружаются из БД при старте)
 ADMIN_IDS = [SUPER_ADMIN_ID]
 
 # Стабильные брони (место: список дней недели, 0=понедельник)
@@ -151,6 +151,17 @@ class Database:
                 )
             """)
 
+            # Таблица для администраторов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS admins (
+                    telegram_id INTEGER PRIMARY KEY,
+                    added_by INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
+                    FOREIGN KEY (added_by) REFERENCES users(telegram_id)
+                )
+            """)
+
             # МИГРАЦИЯ: Добавляем новые колонки если их нет
             try:
                 cursor.execute("SELECT booking_type FROM bookings LIMIT 1")
@@ -171,6 +182,14 @@ class Database:
                         "INSERT INTO places (id, name, description) VALUES (?, ?, ?)",
                         (i, f"Место №{i}", f"Рабочее место номер {i}")
                     )
+
+            # Добавляем главного админа в таблицу admins, если его там нет
+            cursor.execute("SELECT COUNT(*) FROM admins WHERE telegram_id = ?", (SUPER_ADMIN_ID,))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO admins (telegram_id, added_by) VALUES (?, ?)",
+                    (SUPER_ADMIN_ID, SUPER_ADMIN_ID)
+                )
 
             conn.commit()
 
@@ -551,65 +570,73 @@ class Database:
                 logger.error(f"Error deleting permanent booking: {e}")
                 return False
 
-    def cleanup_duplicate_permanent_bookings(self) -> int:
-        """Удалить дублирующиеся постоянные брони (оставить самую свежую)"""
+    def add_admin(self, admin_id: int, added_by: int) -> bool:
+        """Добавить администратора в БД"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # Находим дубли: одинаковые user_id + place_id
                 cursor.execute("""
-                    SELECT user_id, place_id, COUNT(*) as cnt
-                    FROM permanent_bookings
-                    WHERE status = 'active'
-                    GROUP BY user_id, place_id
-                    HAVING cnt > 1
-                """)
-
-                duplicates = cursor.fetchall()
-                deleted_count = 0
-
-                for user_id, place_id, count in duplicates:
-                    # Оставляем только самую новую запись
-                    cursor.execute("""
-                        SELECT id FROM permanent_bookings
-                        WHERE user_id = ? AND place_id = ? AND status = 'active'
-                        ORDER BY created_at DESC
-                    """, (user_id, place_id))
-
-                    all_ids = [row[0] for row in cursor.fetchall()]
-
-                    # Удаляем все кроме первой (самой новой)
-                    ids_to_delete = all_ids[1:]
-
-                    for pb_id in ids_to_delete:
-                        cursor.execute("""
-                            UPDATE permanent_bookings
-                            SET status = 'deleted'
-                            WHERE id = ?
-                        """, (pb_id,))
-
-                        # Удаляем брони, связанные с этой постоянной
-                        today = datetime.now().date().strftime("%d.%m.%Y")
-                        cursor.execute("""
-                            UPDATE bookings
-                            SET status = 'cancelled'
-                            WHERE permanent_booking_id = ? 
-                            AND booking_date >= ?
-                            AND status = 'active'
-                        """, (pb_id, today))
-
-                        deleted_count += 1
-                        logger.info(f"Deleted duplicate permanent booking {pb_id}")
-
+                    INSERT OR IGNORE INTO admins (telegram_id, added_by)
+                    VALUES (?, ?)
+                """, (admin_id, added_by))
                 conn.commit()
-                return deleted_count
+                return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"Error cleaning up duplicates: {e}")
-                return 0
+                logger.error(f"Error adding admin: {e}")
+                return False
+
+    def remove_admin(self, admin_id: int) -> bool:
+        """Удалить администратора из БД (кроме главного)"""
+        if admin_id == SUPER_ADMIN_ID:
+            return False
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    DELETE FROM admins WHERE telegram_id = ?
+                """, (admin_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"Error removing admin: {e}")
+                return False
+
+    def get_all_admins(self) -> List[int]:
+        """Получить список всех администраторов из БД"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT telegram_id FROM admins")
+            return [row[0] for row in cursor.fetchall()]
+
+    def get_all_admins_with_info(self) -> List[Dict]:
+        """Получить список администраторов с информацией о них"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT a.telegram_id, u.username, u.first_name
+                FROM admins a
+                LEFT JOIN users u ON a.telegram_id = u.telegram_id
+                ORDER BY a.telegram_id
+            """)
+
+            admins = []
+            for row in cursor.fetchall():
+                admins.append({
+                    'telegram_id': row[0],
+                    'username': row[1],
+                    'first_name': row[2]
+                })
+            return admins
 
 
 # Инициализация
 db = Database()
+
+# Загружаем список администраторов из БД
+ADMIN_IDS = db.get_all_admins()
+logger.info(f"Loaded {len(ADMIN_IDS)} admins from database: {ADMIN_IDS}")
+
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -1964,11 +1991,23 @@ async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
 
-    current_admins = ", ".join(str(aid) for aid in ADMIN_IDS)
+    # Получаем список админов с информацией
+    admins_info = db.get_all_admins_with_info()
+
+    admins_list = []
+    for admin in admins_info:
+        if admin['username']:
+            admins_list.append(f"@{admin['username']} (ID: {admin['telegram_id']})")
+        elif admin['first_name']:
+            admins_list.append(f"{admin['first_name']} (ID: {admin['telegram_id']})")
+        else:
+            admins_list.append(f"ID: {admin['telegram_id']}")
+
+    admins_text = "\n".join([f"• {info}" for info in admins_list])
 
     await callback.message.answer(
         f"👤 <b>Добавление администратора</b>\n\n"
-        f"Текущие админы: <code>{current_admins}</code>\n\n"
+        f"Текущие админы:\n{admins_text}\n\n"
         f"Введите Telegram ID или @username нового администратора:\n"
         f"Примеры: <code>123456789</code> или <code>@username</code>\n\n"
         f"⚠️ Если указываете username, пользователь должен сначала запустить бота командой /start",
@@ -2010,13 +2049,22 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
     if new_admin_id in ADMIN_IDS:
         await message.answer(f"❌ Пользователь {new_admin_id} уже является администратором.")
     else:
-        ADMIN_IDS.append(new_admin_id)
-        await message.answer(
-            f"✅ <b>Администратор добавлен!</b>\n\n"
-            f"👤 Telegram ID: <code>{new_admin_id}</code>\n\n"
-            f"⚠️ Изменения вступят в силу после перезапуска бота.",
-            parse_mode="HTML"
-        )
+        # Добавляем в БД
+        success = db.add_admin(new_admin_id, message.from_user.id)
+
+        if success:
+            # Добавляем в список в памяти
+            ADMIN_IDS.append(new_admin_id)
+
+            await message.answer(
+                f"✅ <b>Администратор добавлен!</b>\n\n"
+                f"👤 Telegram ID: <code>{new_admin_id}</code>\n\n"
+                f"Права вступили в силу немедленно!",
+                parse_mode="HTML"
+            )
+            logger.info(f"Admin {new_admin_id} added by {message.from_user.id}")
+        else:
+            await message.answer("❌ Ошибка при добавлении администратора.")
 
     await state.clear()
 
@@ -2027,19 +2075,39 @@ async def admin_remove_admin_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
 
-    removable_admins = [aid for aid in ADMIN_IDS if aid != SUPER_ADMIN_ID]
+    # Получаем список админов с информацией (кроме главного)
+    admins_info = db.get_all_admins_with_info()
+    removable_admins = [a for a in admins_info if a['telegram_id'] != SUPER_ADMIN_ID]
 
     if not removable_admins:
         await callback.answer("Нет админов для удаления (мама бота защищена)", show_alert=True)
         return
 
-    admins_list = "\n".join([f"• <code>{aid}</code>" for aid in removable_admins])
+    admins_list = []
+    for admin in removable_admins:
+        if admin['username']:
+            admins_list.append(f"• @{admin['username']} (ID: <code>{admin['telegram_id']}</code>)")
+        elif admin['first_name']:
+            admins_list.append(f"• {admin['first_name']} (ID: <code>{admin['telegram_id']}</code>)")
+        else:
+            admins_list.append(f"• ID: <code>{admin['telegram_id']}</code>")
+
+    admins_text = "\n".join(admins_list)
+
+    # Информация о главном админе
+    super_admin_info = next((a for a in admins_info if a['telegram_id'] == SUPER_ADMIN_ID), None)
+    if super_admin_info and super_admin_info['username']:
+        super_display = f"@{super_admin_info['username']}"
+    elif super_admin_info and super_admin_info['first_name']:
+        super_display = super_admin_info['first_name']
+    else:
+        super_display = f"ID: {SUPER_ADMIN_ID}"
 
     await callback.message.answer(
         f"🗑 <b>Удаление администратора</b>\n\n"
-        f"Админы (кроме мамы бота):\n{admins_list}\n\n"
-        f"⚠️ <b>Мама бота</b> (ID: <code>{SUPER_ADMIN_ID}</code>) защищена\n\n"
-        f"Введите ID для удаления:",
+        f"Админы (доступны для удаления):\n{admins_text}\n\n"
+        f"⚠️ <b>Мама бота</b> ({super_display}, ID: <code>{SUPER_ADMIN_ID}</code>) защищена\n\n"
+        f"Введите Telegram ID или @username для удаления:",
         parse_mode="HTML"
     )
     await state.set_state(AdminStates.removing_admin)
@@ -2052,23 +2120,48 @@ async def admin_remove_admin_process(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    identifier = message.text.strip()
+
+    # Пытаемся распознать ID или username
     try:
-        remove_admin_id = int(message.text.strip())
-
-        if remove_admin_id == SUPER_ADMIN_ID:
-            await message.answer(f"❌ Нельзя удалить маму бота (ID: {SUPER_ADMIN_ID})!")
-        elif remove_admin_id not in ADMIN_IDS:
-            await message.answer(f"❌ Пользователь {remove_admin_id} не админ.")
-        else:
-            ADMIN_IDS.remove(remove_admin_id)
-            await message.answer(
-                f"✅ Администратор {remove_admin_id} удалён!\n\n"
-                f"⚠️ Изменения после перезапуска."
-            )
-
-        await state.clear()
+        # Если это число - это ID
+        remove_admin_id = int(identifier)
     except ValueError:
-        await message.answer("❌ Неверный формат. Введите числовой ID.")
+        # Если не число - это username
+        remove_admin_id = db.find_user_by_username(identifier)
+        if not remove_admin_id:
+            await message.answer(
+                f"❌ <b>Пользователь не найден</b>\n\n"
+                f"Проверьте правильность username или используйте Telegram ID.",
+                parse_mode="HTML"
+            )
+            await state.clear()
+            return
+
+    # Проверки
+    if remove_admin_id == SUPER_ADMIN_ID:
+        await message.answer(f"❌ Нельзя удалить маму бота (ID: {SUPER_ADMIN_ID})!")
+    elif remove_admin_id not in ADMIN_IDS:
+        await message.answer(f"❌ Пользователь {remove_admin_id} не является администратором.")
+    else:
+        # Удаляем из БД
+        success = db.remove_admin(remove_admin_id)
+
+        if success:
+            # Удаляем из списка в памяти
+            ADMIN_IDS.remove(remove_admin_id)
+
+            await message.answer(
+                f"✅ <b>Администратор удалён!</b>\n\n"
+                f"👤 Telegram ID: <code>{remove_admin_id}</code>\n\n"
+                f"Права отозваны немедленно!",
+                parse_mode="HTML"
+            )
+            logger.info(f"Admin {remove_admin_id} removed by {message.from_user.id}")
+        else:
+            await message.answer("❌ Ошибка при удалении администратора.")
+
+    await state.clear()
 
 
 @router.callback_query(F.data == "admin_cancel_action")
