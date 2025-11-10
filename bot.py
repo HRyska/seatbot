@@ -522,16 +522,30 @@ class Database:
                 """, (permanent_id,))
 
                 # Удаляем все будущие брони этой постоянной брони
-                today = datetime.now().date().strftime("%d.%m.%Y")
+                # Получаем все брони с этим permanent_booking_id
                 cursor.execute("""
-                    UPDATE bookings
-                    SET status = 'cancelled'
-                    WHERE permanent_booking_id = ? 
-                    AND booking_date >= ?
-                    AND status = 'active'
-                """, (permanent_id, today))
+                    SELECT id, booking_date FROM bookings
+                    WHERE permanent_booking_id = ? AND status = 'active'
+                """, (permanent_id,))
+
+                bookings_to_check = cursor.fetchall()
+                today = datetime.now().date()
+
+                # Проверяем каждую бронь и удаляем только будущие
+                for booking_id, booking_date_str in bookings_to_check:
+                    # Конвертируем строку DD.MM.YYYY в объект date
+                    booking_date = datetime.strptime(booking_date_str, "%d.%m.%Y").date()
+
+                    # Если дата в будущем - отменяем
+                    if booking_date >= today:
+                        cursor.execute("""
+                            UPDATE bookings
+                            SET status = 'cancelled'
+                            WHERE id = ?
+                        """, (booking_id,))
 
                 conn.commit()
+                logger.info(f"Deleted permanent booking {permanent_id} and future bookings")
                 return True
             except Exception as e:
                 logger.error(f"Error deleting permanent booking: {e}")
@@ -1345,7 +1359,7 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
 
             await callback.message.answer(
                 f"Изменить бронь пользователя {data['target_user_id']}:\n"
-                f"Новое место: №{place_id} на {data['new_booking_date']}?",
+                f"Новое место: №{place_id} на {data['booking_date']}?",  # ✅ ИСПРАВЛЕНО
                 reply_markup=get_confirmation_keyboard()
             )
 
@@ -1420,7 +1434,7 @@ async def confirm_action(callback: CallbackQuery, state: FSMContext):
             old_booking_id = data.get('old_booking_id')
             target_user_id = data.get('target_user_id')
             new_place_id = data.get('new_place_id')
-            new_date = data.get('new_booking_date')
+            new_date = data.get('booking_date')  # ✅ ИСПРАВЛЕНО: было new_booking_date
 
             db.cancel_booking_admin(old_booking_id)
             success = db.create_booking_for_user(user_id, target_user_id, new_place_id, new_date)
@@ -1955,7 +1969,9 @@ async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"👤 <b>Добавление администратора</b>\n\n"
         f"Текущие админы: <code>{current_admins}</code>\n\n"
-        f"Введите Telegram ID нового администратора:",
+        f"Введите Telegram ID или @username нового администратора:\n"
+        f"Примеры: <code>123456789</code> или <code>@username</code>\n\n"
+        f"⚠️ Если указываете username, пользователь должен сначала запустить бота командой /start",
         parse_mode="HTML"
     )
     await state.set_state(AdminStates.adding_admin)
@@ -1968,21 +1984,41 @@ async def admin_add_admin_process(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    identifier = message.text.strip()
+
+    # Пытаемся распознать ID или username
     try:
-        new_admin_id = int(message.text.strip())
-
-        if new_admin_id in ADMIN_IDS:
-            await message.answer(f"❌ Пользователь {new_admin_id} уже администратор.")
-        else:
-            ADMIN_IDS.append(new_admin_id)
-            await message.answer(
-                f"✅ Пользователь {new_admin_id} добавлен!\n\n"
-                f"⚠️ Изменения после перезапуска бота."
-            )
-
-        await state.clear()
+        # Если это число - это ID
+        new_admin_id = int(identifier)
     except ValueError:
-        await message.answer("❌ Неверный формат. Введите числовой ID.")
+        # Если не число - это username
+        new_admin_id = db.find_user_by_username(identifier)
+        if not new_admin_id:
+            await message.answer(
+                f"❌ <b>Пользователь не найден</b>\n\n"
+                f"Возможные причины:\n"
+                f"• Неверный username\n"
+                f"• Пользователь ещё не запускал бота\n\n"
+                f"💡 Попросите пользователя сначала запустить бота командой /start, "
+                f"затем попробуйте снова или используйте Telegram ID.",
+                parse_mode="HTML"
+            )
+            await state.clear()
+            return
+
+    # Проверяем, не является ли уже админом
+    if new_admin_id in ADMIN_IDS:
+        await message.answer(f"❌ Пользователь {new_admin_id} уже является администратором.")
+    else:
+        ADMIN_IDS.append(new_admin_id)
+        await message.answer(
+            f"✅ <b>Администратор добавлен!</b>\n\n"
+            f"👤 Telegram ID: <code>{new_admin_id}</code>\n\n"
+            f"⚠️ Изменения вступят в силу после перезапуска бота.",
+            parse_mode="HTML"
+        )
+
+    await state.clear()
 
 
 @router.callback_query(F.data == "admin_remove_admin")
