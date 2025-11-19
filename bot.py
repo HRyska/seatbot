@@ -36,11 +36,6 @@ SUPER_ADMIN_ID = 528599224
 # ID администраторов (загружаются из БД при старте)
 ADMIN_IDS = [SUPER_ADMIN_ID]
 
-# Стабильные брони (место: список дней недели, 0=понедельник)
-PERMANENT_BOOKINGS = {
-    7: [1, 3]  # Место №7 по вторникам и четвергам
-}
-
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -224,20 +219,32 @@ class Database:
             """, (date,))
             booked = [row[0] for row in cursor.fetchall()]
 
-            # Получаем занятые места из постоянных броней (на этот день недели)
+            # Получаем места из постоянных броней на этот день недели
             cursor.execute("""
                 SELECT place_id FROM permanent_bookings
                 WHERE status = 'active' AND weekdays LIKE ?
             """, (f'%{weekday}%',))
-            permanent_booked = [row[0] for row in cursor.fetchall()]
+            permanent_candidates = [row[0] for row in cursor.fetchall()]
+
+            # 🔥 ИСПРАВЛЕНИЕ: Проверяем, не отменена ли конкретная дата
+            # Для каждого места из постоянных броней проверяем,
+            # есть ли отменённая бронь на эту дату
+            permanent_booked = []
+            for place_id in permanent_candidates:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM bookings
+                    WHERE place_id = ? 
+                      AND booking_date = ? 
+                      AND booking_type = 'permanent'
+                      AND status = 'cancelled'
+                """, (place_id, date))
+
+                # Если нет отменённой брони - место занято постоянной бронью
+                if cursor.fetchone()[0] == 0:
+                    permanent_booked.append(place_id)
 
         available = []
         for place_id in range(1, TOTAL_PLACES + 1):
-            # Проверяем старые PERMANENT_BOOKINGS (хардкод в коде)
-            if place_id in PERMANENT_BOOKINGS:
-                if weekday in PERMANENT_BOOKINGS[place_id]:
-                    continue
-
             # Проверяем занятость
             if place_id not in booked and place_id not in permanent_booked:
                 available.append(place_id)
@@ -1386,7 +1393,7 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
 
             await callback.message.answer(
                 f"Изменить бронь пользователя {data['target_user_id']}:\n"
-                f"Новое место: №{place_id} на {data['booking_date']}?",  # ✅ ИСПРАВЛЕНО
+                f"Новое место: №{place_id} на {data['booking_date']}?",
                 reply_markup=get_confirmation_keyboard()
             )
 
@@ -1461,7 +1468,7 @@ async def confirm_action(callback: CallbackQuery, state: FSMContext):
             old_booking_id = data.get('old_booking_id')
             target_user_id = data.get('target_user_id')
             new_place_id = data.get('new_place_id')
-            new_date = data.get('booking_date')  # ✅ ИСПРАВЛЕНО: было new_booking_date
+            new_date = data.get('booking_date')
 
             db.cancel_booking_admin(old_booking_id)
             success = db.create_booking_for_user(user_id, target_user_id, new_place_id, new_date)
@@ -1962,7 +1969,7 @@ async def admin_change_map_process(message: Message, state: FSMContext):
             caption="✅ <b>Карта офиса успешно обновлена!</b>\n\n"
                     "Новая карта будет отображаться при следующем бронировании.\n\n"
                     f"📊 Формат: {message.document.mime_type if message.document else 'JPEG (compressed)'}\n"
-                    f"📏 Размер: {file.file_size / 1024:.1f} KB",
+                    f"📁 Размер: {file.file_size / 1024:.1f} KB",
             parse_mode="HTML"
         )
 
