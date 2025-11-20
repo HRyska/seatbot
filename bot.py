@@ -1081,16 +1081,35 @@ async def process_bookings_calendar_navigation(callback: CallbackQuery, state: F
         year = int(year)
         month = int(month)
 
-        user_id = callback.from_user.id
+        current_state = await state.get_state()
+        data = await state.get_data()
+
+        # Определяем ID пользователя в зависимости от состояния
+        if current_state in ["AdminStates:selecting_user_booking", "AdminStates:change_for_user_date"]:
+            user_id = data.get('target_user_id')
+        else:
+            user_id = callback.from_user.id
+
         bookings = db.get_user_bookings(user_id)
         booked_dates = [b['date'] for b in bookings]
 
+        # 📌 Для постоянных броней - показываем только постоянные
+        if current_state in ["AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+            booked_dates = [b['date'] for b in bookings if b.get('booking_type') == 'permanent']
+
         # Определяем текст в зависимости от состояния
-        current_state = await state.get_state()
         if current_state == "CancelStates:selecting_booking":
             header = "❌ <b>Отмена брони</b>\n\n"
         elif current_state == "ChangeStates:selecting_booking":
             header = "🔁 <b>Изменение брони</b>\n\n"
+        elif current_state == "AdminStates:selecting_user_booking":
+            header = f"👤 <b>Отмена брони пользователя {user_id}</b>\n\n"
+        elif current_state == "AdminStates:change_for_user_date":
+            header = f"👤 <b>Изменение брони пользователя {user_id}</b>\n\n"
+        elif current_state == "AdminStates:view_permanent_user":
+            header = f"📌 <b>Постоянные брони пользователя {user_id}</b>\n\n"
+        elif current_state == "AdminStates:delete_permanent_select":
+            header = f"📌 <b>Календарь постоянных броней пользователя {user_id}</b>\n\n"
         else:
             header = "📅 <b>Ваши брони</b>\n\n"
 
@@ -1112,89 +1131,40 @@ async def close_calendar(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
 
-# Просмотр деталей брони по дате
-@router.callback_query(F.data.startswith("view_booking_"))
-async def view_booking_details(callback: CallbackQuery, state: FSMContext):
-    try:
-        date_str = callback.data.split("view_booking_")[1]
-        user_id = callback.from_user.id
-
-        # Получаем все брони пользователя
-        bookings = db.get_user_bookings(user_id)
-
-        # Находим бронь на эту дату
-        booking = None
-        for b in bookings:
-            if b['date'] == date_str:
-                booking = b
-                break
-
-        if not booking:
-            await callback.answer("Бронь не найдена", show_alert=True)
-            return
-
-        # Определяем текущее состояние для формирования кнопок
-        current_state = await state.get_state()
-
-        # Формируем текст
-        booking_type_text = "Постоянная бронь" if booking.get('booking_type') == 'permanent' else "Обычная бронь"
-        icon = "📌" if booking.get('booking_type') == 'permanent' else "📅"
-
-        text = (
-            f"{icon} <b>Бронь на {date_str}</b>\n\n"
-            f"🪑 Место: {booking['place_name']}\n"
-            f"📅 Дата: {date_str}\n"
-            f"📋 Тип: {booking_type_text}"
-        )
-
-        # Формируем кнопки действий
-        buttons = []
-
-        # Сохраняем ID брони в состояние для дальнейших действий
-        await state.update_data(selected_booking_id=booking['id'])
-
-        # Если мы в процессе отмены - показываем кнопку отмены
-        if current_state == "CancelStates:selecting_booking":
-            buttons.append([InlineKeyboardButton(text="❌ Отменить эту бронь",
-                                                 callback_data=f"confirm_cancel_booking_{booking['id']}")])
-        # Если в процессе изменения - показываем кнопку изменения
-        elif current_state == "ChangeStates:selecting_booking":
-            buttons.append([InlineKeyboardButton(text="🔁 Изменить эту бронь",
-                                                 callback_data=f"confirm_change_booking_{booking['id']}")])
-        # Если просто просмотр - показываем обе кнопки
-        else:
-            buttons.append([
-                InlineKeyboardButton(text="❌ Отменить", callback_data=f"confirm_cancel_booking_{booking['id']}"),
-                InlineKeyboardButton(text="🔁 Изменить", callback_data=f"confirm_change_booking_{booking['id']}")
-            ])
-
-        # Кнопка возврата к календарю
-        buttons.append([InlineKeyboardButton(text="◀️ Назад к календарю", callback_data="back_to_bookings_calendar")])
-
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode="HTML"
-        )
-        await callback.answer()
-
-    except Exception as e:
-        logger.error(f"Error viewing booking details: {e}", exc_info=True)
-        await callback.answer("Ошибка при просмотре деталей", show_alert=True)
-
-
 @router.callback_query(F.data == "back_to_bookings_calendar")
 async def back_to_bookings_calendar(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    current_state = await state.get_state()
+    data = await state.get_data()
+
+    # Определяем ID пользователя в зависимости от состояния
+    if current_state in ["AdminStates:selecting_user_booking", "AdminStates:change_for_user_date",
+                         "AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+        user_id = data.get('target_user_id')
+    else:
+        user_id = callback.from_user.id
+
     bookings = db.get_user_bookings(user_id)
     booked_dates = [b['date'] for b in bookings]
+
+    # 📌 Для постоянных броней - показываем только постоянные
+    if current_state in ["AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+        booked_dates = [b['date'] for b in bookings if b.get('booking_type') == 'permanent']
+
     now = datetime.now()
 
-    current_state = await state.get_state()
+    # Определяем заголовок
     if current_state == "CancelStates:selecting_booking":
         header = "❌ <b>Отмена брони</b>\n\n"
     elif current_state == "ChangeStates:selecting_booking":
         header = "🔁 <b>Изменение брони</b>\n\n"
+    elif current_state == "AdminStates:selecting_user_booking":
+        header = f"👤 <b>Отмена брони пользователя {user_id}</b>\n\n"
+    elif current_state == "AdminStates:change_for_user_date":
+        header = f"👤 <b>Изменение брони пользователя {user_id}</b>\n\n"
+    elif current_state == "AdminStates:view_permanent_user":
+        header = f"📌 <b>Постоянные брони пользователя {user_id}</b>\n\n"
+    elif current_state == "AdminStates:delete_permanent_select":
+        header = f"📌 <b>Календарь постоянных броней пользователя {user_id}</b>\n\n"
     else:
         header = "📅 <b>Ваши брони</b>\n\n"
 
@@ -1396,6 +1366,17 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
                 f"Новое место: №{place_id} на {data['booking_date']}?",
                 reply_markup=get_confirmation_keyboard()
             )
+
+        elif current_state == "AdminStates:permanent_place_id":
+            # 📌 Выбор места для постоянной брони
+            await state.update_data(permanent_place_id=place_id)
+
+            await callback.message.answer(
+                f"🪑 Место №{place_id}\n\n"
+                "Выберите дни недели для постоянной брони:",
+                reply_markup=get_weekday_keyboard([])
+            )
+            await state.set_state(AdminStates.permanent_days)
 
         await callback.answer()
     except Exception as e:
@@ -1600,6 +1581,104 @@ async def process_booking_action(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Error in booking action: {e}", exc_info=True)
 
 
+# 🆕 Обработчик кликов по календарю в админских состояниях для отмены/изменения
+@router.callback_query(F.data.startswith("view_booking_"))
+async def view_booking_details_universal(callback: CallbackQuery, state: FSMContext):
+    """Универсальный обработчик для просмотра брони через календарь"""
+    try:
+        date_str = callback.data.split("view_booking_")[1]
+        current_state = await state.get_state()
+        data = await state.get_data()
+
+        # Определяем ID пользователя в зависимости от состояния
+        if current_state in ["AdminStates:selecting_user_booking", "AdminStates:change_for_user_date",
+                             "AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+            user_id = data.get('target_user_id')
+        else:
+            user_id = callback.from_user.id
+
+        # Получаем все брони пользователя
+        bookings = db.get_user_bookings(user_id)
+
+        # Находим бронь на эту дату
+        booking = None
+        for b in bookings:
+            if b['date'] == date_str:
+                booking = b
+                break
+
+        if not booking:
+            await callback.answer("❌ Бронь не найдена", show_alert=True)
+            return
+
+        # Формируем текст
+        booking_type_text = "Постоянная бронь" if booking.get('booking_type') == 'permanent' else "Обычная бронь"
+        icon = "📌" if booking.get('booking_type') == 'permanent' else "📅"
+
+        text = (
+            f"{icon} <b>Бронь на {date_str}</b>\n\n"
+            f"🪑 Место: {booking['place_name']}\n"
+            f"📅 Дата: {date_str}\n"
+            f"📋 Тип: {booking_type_text}"
+        )
+
+        # Если это постоянная бронь, добавляем информацию о постоянной брони
+        if booking.get('booking_type') == 'permanent' and booking.get('permanent_booking_id'):
+            permanent_bookings = db.get_permanent_bookings(user_id)
+            for pb in permanent_bookings:
+                if pb['id'] == booking['permanent_booking_id']:
+                    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                    days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+                    text += f"\n🔄 Повторяется: {days_text}"
+                    break
+
+        # Добавляем информацию о пользователе для админа
+        if current_state in ["AdminStates:selecting_user_booking", "AdminStates:change_for_user_date",
+                             "AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+            text = f"👤 <b>Пользователь ID: {user_id}</b>\n\n" + text
+
+        # Формируем кнопки действий
+        buttons = []
+        await state.update_data(selected_booking_id=booking['id'])
+
+        # Кнопки в зависимости от состояния
+        if current_state == "CancelStates:selecting_booking":
+            buttons.append([InlineKeyboardButton(text="❌ Отменить эту бронь",
+                                                 callback_data=f"confirm_cancel_booking_{booking['id']}")])
+        elif current_state == "ChangeStates:selecting_booking":
+            buttons.append([InlineKeyboardButton(text="🔁 Изменить эту бронь",
+                                                 callback_data=f"confirm_change_booking_{booking['id']}")])
+        elif current_state == "AdminStates:selecting_user_booking":
+            buttons.append([InlineKeyboardButton(text="❌ Отменить эту бронь",
+                                                 callback_data=f"booking_{booking['id']}")])
+        elif current_state == "AdminStates:change_for_user_date":
+            buttons.append([InlineKeyboardButton(text="🔁 Изменить эту бронь",
+                                                 callback_data=f"booking_{booking['id']}")])
+        elif current_state in ["AdminStates:view_permanent_user", "AdminStates:delete_permanent_select"]:
+            # Для постоянных броней - только просмотр, без действий
+            pass
+        else:
+            # Обычный просмотр - обе кнопки
+            buttons.append([
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"confirm_cancel_booking_{booking['id']}"),
+                InlineKeyboardButton(text="🔁 Изменить", callback_data=f"confirm_change_booking_{booking['id']}")
+            ])
+
+        # Кнопка возврата к календарю
+        buttons.append([InlineKeyboardButton(text="◀️ Назад к календарю", callback_data="back_to_bookings_calendar")])
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error viewing booking details: {e}", exc_info=True)
+        await callback.answer("Ошибка при просмотре деталей", show_alert=True)
+
+
 # АДМИН-ПАНЕЛЬ
 @router.message(F.text == "⚙️ АДМИН-ПАНЕЛЬ")
 async def admin_panel(message: Message):
@@ -1772,10 +1851,24 @@ async def admin_process_user_identifier(message: Message, state: FSMContext):
 
     await state.update_data(target_user_id=user_id)
 
-    await message.answer(
-        "Выберите бронь для отмены:",
-        reply_markup=get_bookings_keyboard(bookings)
-    )
+    # 📅 Если броней 3+, показываем календарь, иначе список
+    if len(bookings) >= 3:
+        booked_dates = [b['date'] for b in bookings]
+        now = datetime.now()
+
+        await message.answer(
+            f"👤 <b>Отмена брони пользователя {user_id}</b>\n\n"
+            "Выберите дату для отмены:\n"
+            "[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "Выберите бронь для отмены:",
+            reply_markup=get_bookings_keyboard(bookings)
+        )
+
     await state.set_state(AdminStates.selecting_user_booking)
 
 
@@ -1859,10 +1952,24 @@ async def admin_change_for_user_select_booking(message: Message, state: FSMConte
 
     await state.update_data(target_user_id=user_id)
 
-    await message.answer(
-        "Выберите бронь для изменения:",
-        reply_markup=get_bookings_keyboard(bookings)
-    )
+    # 📅 Если броней 3+, показываем календарь, иначе список
+    if len(bookings) >= 3:
+        booked_dates = [b['date'] for b in bookings]
+        now = datetime.now()
+
+        await message.answer(
+            f"👤 <b>Изменение брони пользователя {user_id}</b>\n\n"
+            "Выберите дату для изменения:\n"
+            "[15] — забронированный день",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, booked_dates),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "Выберите бронь для изменения:",
+            reply_markup=get_bookings_keyboard(bookings)
+        )
+
     await state.set_state(AdminStates.change_for_user_date)
 
 
@@ -2236,36 +2343,26 @@ async def admin_permanent_get_user(message: Message, state: FSMContext):
 
     await state.update_data(permanent_user_id=user_id)
 
+    # 🗺️ Показываем карту офиса
+    if os.path.exists(OFFICE_MAP_PATH):
+        try:
+            photo = FSInputFile(OFFICE_MAP_PATH)
+            await message.answer_photo(
+                photo=photo,
+                caption=f"🗺️ Карта офиса\n\nСоздание постоянной брони для пользователя {user_id}"
+            )
+        except Exception as e:
+            logger.error(f"Error sending office map: {e}")
+
+    # Показываем все доступные места кнопками (1-13)
+    all_places = list(range(1, TOTAL_PLACES + 1))
+
     await message.answer(
         f"👤 Пользователь: ID {user_id}\n\n"
-        "Введите номер места (1-13):",
+        "👇 Выберите место:",
+        reply_markup=get_places_keyboard(all_places)
     )
     await state.set_state(AdminStates.permanent_place_id)
-
-
-@router.message(AdminStates.permanent_place_id)
-async def admin_permanent_get_place(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    try:
-        place_id = int(message.text.strip())
-        if place_id < 1 or place_id > TOTAL_PLACES:
-            await message.answer(f"❌ Номер места должен быть от 1 до {TOTAL_PLACES}")
-            return
-    except ValueError:
-        await message.answer("❌ Введите число от 1 до 13")
-        return
-
-    await state.update_data(permanent_place_id=place_id)
-
-    await message.answer(
-        f"🪑 Место №{place_id}\n\n"
-        "Выберите дни недели для постоянной брони:",
-        reply_markup=get_weekday_keyboard([])
-    )
-    await state.set_state(AdminStates.permanent_days)
 
 
 @router.callback_query(AdminStates.permanent_days, F.data.startswith("weekday_"))
@@ -2492,6 +2589,7 @@ async def admin_delete_permanent_select(message: Message, state: FSMContext):
 
     weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+    # Показываем список постоянных броней для выбора
     buttons = []
     for pb in permanent_bookings:
         days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
@@ -2504,6 +2602,22 @@ async def admin_delete_permanent_select(message: Message, state: FSMContext):
         "Выберите постоянную бронь для удаления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
+
+    # 📅 Показываем календарь с постоянными бронями
+    all_bookings = db.get_user_bookings(user_id)
+    permanent_dates = [b['date'] for b in all_bookings if b.get('booking_type') == 'permanent']
+
+    if permanent_dates:
+        now = datetime.now()
+        await message.answer(
+            f"📅 <b>Календарь постоянных броней пользователя {user_id}</b>\n\n"
+            f"[15] — день с постоянной бронью\n\n"
+            f"Красным выделены все даты, которые будут отменены при удалении постоянной брони.",
+            reply_markup=get_bookings_calendar_keyboard(now.year, now.month, permanent_dates),
+            parse_mode="HTML"
+        )
+
+    await state.update_data(target_user_id=user_id)
     await state.set_state(AdminStates.delete_permanent_select)
 
 
