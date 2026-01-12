@@ -82,6 +82,12 @@ class AdminStates(StatesGroup):
     # Удаление постоянной брони
     delete_permanent_user = State()
     delete_permanent_select = State()
+    # Продление постоянной брони
+    extend_permanent_user = State()
+    extend_permanent_select = State()
+    extend_permanent_edit_place = State()
+    extend_permanent_edit_days = State()
+    extend_permanent_confirm = State()
 
 
 # База данных
@@ -337,17 +343,30 @@ class Database:
                 }
             return None
 
-    def get_all_bookings(self) -> List[Dict]:
+    def get_all_bookings(self, future_only: bool = False) -> List[Dict]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT b.id, b.user_id, u.username, u.first_name, b.place_id, p.name, b.booking_date
-                FROM bookings b
-                JOIN places p ON b.place_id = p.id
-                JOIN users u ON b.user_id = u.telegram_id
-                WHERE b.status = 'active'
-                ORDER BY b.booking_date, b.place_id
-            """)
+
+            if future_only:
+                # Получаем только будущие брони
+                today = datetime.now().strftime("%d.%m.%Y")
+                cursor.execute("""
+                    SELECT b.id, b.user_id, u.username, u.first_name, b.place_id, p.name, b.booking_date, b.booking_type
+                    FROM bookings b
+                    JOIN places p ON b.place_id = p.id
+                    JOIN users u ON b.user_id = u.telegram_id
+                    WHERE b.status = 'active' AND b.booking_date >= ?
+                    ORDER BY b.booking_date, b.place_id
+                """, (today,))
+            else:
+                cursor.execute("""
+                    SELECT b.id, b.user_id, u.username, u.first_name, b.place_id, p.name, b.booking_date, b.booking_type
+                    FROM bookings b
+                    JOIN places p ON b.place_id = p.id
+                    JOIN users u ON b.user_id = u.telegram_id
+                    WHERE b.status = 'active'
+                    ORDER BY b.booking_date, b.place_id
+                """)
 
             bookings = []
             for row in cursor.fetchall():
@@ -358,7 +377,8 @@ class Database:
                     'first_name': row[3],
                     'place_id': row[4],
                     'place_name': row[5],
-                    'date': row[6]
+                    'date': row[6],
+                    'booking_type': row[7] if len(row) > 7 else 'regular'
                 })
             return bookings
 
@@ -469,10 +489,10 @@ class Database:
 
                 permanent_id = cursor.lastrowid
 
-                # Создаём брони на ближайшие 60 дней
+                # Создаём брони на ближайшие 90 дней
                 today = datetime.now().date()
                 created_count = 0
-                for i in range(60):
+                for i in range(90):
                     check_date = today + timedelta(days=i)
                     if check_date.weekday() in weekdays:
                         date_str = check_date.strftime("%d.%m.%Y")
@@ -534,6 +554,133 @@ class Database:
                     'created_at': row[7]
                 })
             return bookings
+
+    def get_permanent_booking_by_id(self, permanent_id: int) -> Optional[Dict]:
+        """Получить постоянную бронь по ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT pb.id, pb.user_id, u.username, u.first_name, pb.place_id, p.name, pb.weekdays
+                FROM permanent_bookings pb
+                JOIN users u ON pb.user_id = u.telegram_id
+                JOIN places p ON pb.place_id = p.id
+                WHERE pb.id = ? AND pb.status = 'active'
+            """, (permanent_id,))
+
+            row = cursor.fetchone()
+            if row:
+                weekdays = [int(d) for d in row[6].split(',')]
+                return {
+                    'id': row[0],
+                    'user_id': row[1],
+                    'username': row[2],
+                    'first_name': row[3],
+                    'place_id': row[4],
+                    'place_name': row[5],
+                    'weekdays': weekdays
+                }
+            return None
+
+    def extend_permanent_booking(self, permanent_id: int, new_place_id: int = None,
+                                 new_weekdays: List[int] = None) -> bool:
+        """Продлить постоянную бронь на 90 дней с возможностью изменения места и дней"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                # Получаем текущую постоянную бронь
+                cursor.execute("""
+                    SELECT user_id, place_id, weekdays FROM permanent_bookings
+                    WHERE id = ? AND status = 'active'
+                """, (permanent_id,))
+
+                result = cursor.fetchone()
+                if not result:
+                    logger.error(f"Permanent booking {permanent_id} not found")
+                    return False
+
+                user_id, old_place_id, old_weekdays_str = result
+                old_weekdays = [int(d) for d in old_weekdays_str.split(',')]
+
+                # Определяем новые параметры (если не переданы, используем старые)
+                final_place_id = new_place_id if new_place_id else old_place_id
+                final_weekdays = new_weekdays if new_weekdays else old_weekdays
+
+                # Если параметры изменились - проверяем конфликты
+                if new_place_id or new_weekdays:
+                    # Проверяем конфликты с другими постоянными бронями
+                    cursor.execute("""
+                        SELECT id, user_id, weekdays FROM permanent_bookings
+                        WHERE place_id = ? AND status = 'active' AND id != ?
+                    """, (final_place_id, permanent_id))
+
+                    existing = cursor.fetchall()
+                    for existing_id, existing_user_id, existing_weekdays_str in existing:
+                        existing_weekdays = [int(d) for d in existing_weekdays_str.split(',')]
+                        if any(day in existing_weekdays for day in final_weekdays):
+                            logger.error(f"Conflict with permanent booking {existing_id}")
+                            return False
+
+                # Удаляем старую постоянную бронь и все её будущие даты
+                cursor.execute("""
+                    UPDATE permanent_bookings
+                    SET status = 'deleted'
+                    WHERE id = ?
+                """, (permanent_id,))
+
+                # Отменяем все будущие брони старой постоянной брони
+                cursor.execute("""
+                    SELECT id, booking_date FROM bookings
+                    WHERE permanent_booking_id = ? AND status = 'active'
+                """, (permanent_id,))
+
+                bookings_to_cancel = cursor.fetchall()
+                today = datetime.now().date()
+
+                for booking_id, booking_date_str in bookings_to_cancel:
+                    booking_date = datetime.strptime(booking_date_str, "%d.%m.%Y").date()
+                    if booking_date >= today:
+                        cursor.execute("""
+                            UPDATE bookings
+                            SET status = 'cancelled'
+                            WHERE id = ?
+                        """, (booking_id,))
+
+                # Создаём новую постоянную бронь
+                cursor.execute("""
+                    INSERT INTO permanent_bookings (user_id, place_id, weekdays, created_by, status)
+                    VALUES (?, ?, ?, ?, 'active')
+                """, (user_id, final_place_id, ','.join(map(str, final_weekdays)), user_id))
+
+                new_permanent_id = cursor.lastrowid
+
+                # Создаём брони на 90 дней
+                created_count = 0
+                for i in range(90):
+                    check_date = today + timedelta(days=i)
+                    if check_date.weekday() in final_weekdays:
+                        date_str = check_date.strftime("%d.%m.%Y")
+
+                        # Проверяем, нет ли уже брони
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM bookings
+                            WHERE place_id = ? AND booking_date = ? AND status = 'active'
+                        """, (final_place_id, date_str))
+
+                        if cursor.fetchone()[0] == 0:
+                            cursor.execute("""
+                                INSERT INTO bookings (user_id, place_id, booking_date, status, booking_type, permanent_booking_id)
+                                VALUES (?, ?, ?, 'active', 'permanent', ?)
+                            """, (user_id, final_place_id, date_str, new_permanent_id))
+                            created_count += 1
+
+                conn.commit()
+                logger.info(
+                    f"Extended permanent booking {permanent_id} -> new {new_permanent_id} with {created_count} dates")
+                return True
+
+            except Exception as e:
+                logger.error(f"Error extending permanent booking: {e}")
+                return False
 
     def delete_permanent_booking(self, permanent_id: int) -> bool:
         """Удалить постоянную бронь и все связанные будущие брони"""
@@ -700,6 +847,7 @@ def get_admin_panel_keyboard():
 def get_permanent_bookings_menu():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать постоянную бронь", callback_data="admin_create_permanent")],
+        [InlineKeyboardButton(text="🔄 Продлить постоянную бронь", callback_data="admin_extend_permanent")],
         [InlineKeyboardButton(text="📋 Все постоянные брони", callback_data="admin_view_all_permanent")],
         [InlineKeyboardButton(text="👤 Постоянные брони пользователя", callback_data="admin_view_user_permanent")],
         [InlineKeyboardButton(text="🗑️ Удалить постоянную бронь", callback_data="admin_delete_permanent")],
@@ -931,7 +1079,7 @@ async def cmd_start(message: Message):
     greeting += f"\n🆔 Ваш Telegram ID: <code>{user.id}</code>\n"
 
     if is_admin_user:
-        greeting += "\n🔑 У вас есть права администратора!"
+        greeting += "\n🔒 У вас есть права администратора!"
 
     greeting += "\nВыбери нужное действие:"
 
@@ -991,7 +1139,7 @@ async def start_cancel(message: Message, state: FSMContext):
         await message.answer("У вас нет активных броней для отмены.")
         return
 
-    # Если броней 3 или больше - показываем календарь
+    # Если броней 3 или больше - показываем календарь, иначе список
     if len(bookings) >= 3:
         booked_dates = [b['date'] for b in bookings]
         now = datetime.now()
@@ -1241,6 +1389,19 @@ async def process_date_selection(callback: CallbackQuery, state: FSMContext):
 
         logger.info(f"Date selected: {date_str}, state: {current_state}")
 
+        # Если это просмотр броней по дате (без состояния)
+        if not current_state:
+            # Перенаправляем на просмотр броней по дате
+            await admin_view_bookings_for_date(
+                type('obj', (object,), {
+                    'data': f'admin_view_date_{date_str}',
+                    'message': callback.message,
+                    'from_user': callback.from_user,
+                    'answer': callback.answer
+                })()
+            )
+            return
+
         # Проверка для обычного бронирования
         if current_state == "BookingStates:waiting_for_date":
             if db.has_user_booking_on_date(user_id, date_str):
@@ -1306,6 +1467,19 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
         data = await state.get_data()
 
         logger.info(f"Place selected: {place_id}, state: {current_state}")
+
+        # Если это просмотр броней по месту (без состояния)
+        if not current_state:
+            # Перенаправляем на просмотр броней по месту
+            await admin_view_bookings_for_place(
+                type('obj', (object,), {
+                    'data': f'admin_view_place_{place_id}',
+                    'message': callback.message,
+                    'from_user': callback.from_user,
+                    'answer': callback.answer
+                })()
+            )
+            return
 
         if current_state == "BookingStates:waiting_for_place":
             booking_date = data.get('booking_date')
@@ -1377,6 +1551,26 @@ async def process_place_selection(callback: CallbackQuery, state: FSMContext):
                 reply_markup=get_weekday_keyboard([])
             )
             await state.set_state(AdminStates.permanent_days)
+
+        elif current_state == "AdminStates:extend_permanent_edit_place":
+            # 🔄 Выбор нового места при продлении
+            await state.update_data(new_place_id=place_id)
+
+            data = await state.get_data()
+            weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            current_weekdays = data.get('current_weekdays', [])
+            days_text = ", ".join([weekday_names[d] for d in sorted(current_weekdays)])
+
+            await callback.message.answer(
+                f"🪑 Место: №{place_id}\n\n"
+                f"📅 <b>Изменение дней недели</b>\n\n"
+                f"Текущие дни: {days_text}\n\n"
+                f"Выберите новые дни или оставьте текущие:",
+                reply_markup=get_weekday_keyboard(current_weekdays),
+                parse_mode="HTML"
+            )
+
+            await state.set_state(AdminStates.extend_permanent_edit_days)
 
         await callback.answer()
     except Exception as e:
@@ -1687,7 +1881,7 @@ async def admin_panel(message: Message):
         return
 
     await message.answer(
-        "🔑 <b>Админ-панель</b>\n\nВыберите действие:",
+        "🔒 <b>Админ-панель</b>\n\nВыберите действие:",
         reply_markup=get_admin_panel_keyboard(),
         parse_mode="HTML"
     )
@@ -1699,79 +1893,155 @@ async def admin_show_all_bookings(callback: CallbackQuery):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
 
-    bookings = db.get_all_bookings()
+    # Показываем меню выбора способа просмотра
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Посмотреть по дате", callback_data="bookings_by_date")],
+        [InlineKeyboardButton(text="🪑 Посмотреть по столу", callback_data="bookings_by_place")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back_to_main")]
+    ])
 
-    if not bookings:
-        await callback.message.answer("📋 Активных броней нет.")
+    await callback.message.edit_text(
+        "📋 <b>Просмотр активных броней</b>\n\n"
+        "Выберите способ просмотра:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# Просмотр по дате
+@router.callback_query(F.data == "bookings_by_date")
+async def bookings_by_date_start(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    now = datetime.now()
+
+    # Показываем календарь для выбора даты
+    await callback.message.edit_text(
+        "📅 <b>Просмотр броней по дате</b>\n\n"
+        "Выберите дату для просмотра:",
+        reply_markup=get_calendar_keyboard(now.year, now.month),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_view_date_"))
+async def admin_view_bookings_for_date(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    date_str = callback.data.split("admin_view_date_")[1]
+
+    # Получаем все будущие брони
+    all_bookings = db.get_all_bookings(future_only=True)
+
+    # Фильтруем брони на эту дату
+    date_bookings = [b for b in all_bookings if b['date'] == date_str]
+
+    if not date_bookings:
+        await callback.message.edit_text(
+            f"📅 <b>Брони на {date_str}</b>\n\n"
+            f"❌ Нет броней на эту дату.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="bookings_by_date")]
+            ]),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
-    # Группируем брони по пользователям
-    from collections import defaultdict
-    bookings_by_user = defaultdict(list)
+    # Сортируем по номеру места
+    date_bookings.sort(key=lambda x: x['place_id'])
 
-    for booking in bookings:
-        bookings_by_user[booking['user_id']].append(booking)
+    text = f"📅 <b>Брони на {date_str}</b>\n\n"
 
-    # Формируем текст порциями
-    messages = []
-    current_message = "📋 <b>Все активные брони:</b>\n\n"
-    total_users = len(bookings_by_user)
-    total_bookings = len(bookings)
+    for booking in date_bookings:
+        user_display = f"@{booking['username']}" if booking['username'] else booking['first_name']
+        booking_type = " 📌" if booking.get('booking_type') == 'permanent' else ""
+        text += f"🪑 <b>Место №{booking['place_id']}</b> → {user_display}{booking_type}\n"
 
-    for user_id, user_bookings in bookings_by_user.items():
-        # Берём имя пользователя из первой брони
-        first_booking = user_bookings[0]
-        user_display = f"@{first_booking['username']}" if first_booking['username'] else first_booking['first_name']
+    text += f"\n━━━━━━━━━━━━━━━━━━━\n📊 Всего: {len(date_bookings)} броней"
 
-        # Подсчитываем количество броней
-        booking_count = len(user_bookings)
-        booking_word = "бронь" if booking_count == 1 else ("брони" if 2 <= booking_count <= 4 else "броней")
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bookings_by_date")]
+        ]),
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
-        user_header = f"👤 {user_display} ({booking_count} {booking_word})\n  "
 
-        # Формируем список броней в одну строку
-        booking_items = []
-        for booking in sorted(user_bookings, key=lambda x: x['date']):
-            # Короткая дата (ДД.ММ)
-            date_parts = booking['date'].split('.')
-            short_date = f"{date_parts[0]}.{date_parts[1]}"
+# Просмотр по столу
+@router.callback_query(F.data == "bookings_by_place")
+async def bookings_by_place_start(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
 
-            # Номер места
-            place_num = booking['place_id']
+    # Показываем список всех мест
+    all_places = list(range(1, TOTAL_PLACES + 1))
 
-            # Добавляем значок для постоянной брони
-            perm_marker = " 📌" if booking.get('booking_type') == 'permanent' else ""
+    await callback.message.edit_text(
+        "🪑 <b>Просмотр броней по столу</b>\n\n"
+        "Выберите место:",
+        reply_markup=get_places_keyboard(all_places),
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
-            booking_items.append(f"{short_date} → №{place_num}{perm_marker}")
 
-        bookings_line = ", ".join(booking_items)
-        user_block = user_header + bookings_line + "\n\n"
+@router.callback_query(F.data.startswith("admin_view_place_"))
+async def admin_view_bookings_for_place(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
 
-        # Проверяем, не превысит ли добавление нового пользователя лимит
-        if len(current_message + user_block) > 3800:
-            messages.append(current_message)
-            current_message = "📋 <b>Все активные брони (продолжение):</b>\n\n"
+    place_id = int(callback.data.split("admin_view_place_")[1])
 
-        current_message += user_block
+    # Получаем все будущие брони
+    all_bookings = db.get_all_bookings(future_only=True)
 
-    # Добавляем итоговую статистику
-    footer = f"━━━━━━━━━━━━━━━━━━━\n📊 {total_users} пользователя • {total_bookings} броней"
+    # Фильтруем только брони для этого места
+    place_bookings = [b for b in all_bookings if b['place_id'] == place_id]
 
-    if len(current_message + footer) > 3800:
-        messages.append(current_message)
-        current_message = footer
-    else:
-        current_message += footer
+    if not place_bookings:
+        await callback.message.edit_text(
+            f"🪑 <b>Место №{place_id}</b>\n\n"
+            f"❌ Нет будущих броней для этого места.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="bookings_by_place")]
+            ]),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
 
-    # Добавляем последнее сообщение
-    if current_message.strip():
-        messages.append(current_message)
+    # Сортируем по дате (уже отсортировано в БД, но на всякий случай)
+    place_bookings.sort(key=lambda x: datetime.strptime(x['date'], "%d.%m.%Y"))
 
-    # Отправляем все части
-    for msg in messages:
-        await callback.message.answer(msg, parse_mode="HTML")
+    text = f"🪑 <b>Место №{place_id}</b>\n\n"
+    text += f"📋 Будущие брони:\n\n"
 
+    for booking in place_bookings:
+        user_display = f"@{booking['username']}" if booking['username'] else booking['first_name']
+        booking_type = " 📌" if booking.get('booking_type') == 'permanent' else ""
+
+        text += f"📅 {booking['date']} → {user_display}{booking_type}\n"
+
+    text += f"\n━━━━━━━━━━━━━━━━━━━\n📊 Всего: {len(place_bookings)} броней"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bookings_by_place")]
+        ]),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 
@@ -2076,7 +2346,7 @@ async def admin_change_map_process(message: Message, state: FSMContext):
             caption="✅ <b>Карта офиса успешно обновлена!</b>\n\n"
                     "Новая карта будет отображаться при следующем бронировании.\n\n"
                     f"📊 Формат: {message.document.mime_type if message.document else 'JPEG (compressed)'}\n"
-                    f"📁 Размер: {file.file_size / 1024:.1f} KB",
+                    f"📏 Размер: {file.file_size / 1024:.1f} KB",
             parse_mode="HTML"
         )
 
@@ -2303,7 +2573,7 @@ async def admin_permanent_menu(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_back_to_main")
 async def admin_back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🔑 <b>Админ-панель</b>\n\nВыберите действие:",
+        "🔒 <b>Админ-панель</b>\n\nВыберите действие:",
         reply_markup=get_admin_panel_keyboard(),
         parse_mode="HTML"
     )
@@ -2388,7 +2658,7 @@ async def admin_permanent_toggle_day(callback: CallbackQuery, state: FSMContext)
             f"👤 Пользователь: ID {user_id}\n"
             f"🪑 Место: №{place_id}\n"
             f"📅 Дни: {days_text}\n\n"
-            f"Создать постоянную бронь на ближайшие 60 дней?",
+            f"Создать постоянную бронь на ближайшие 90 дней?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="✅ Создать", callback_data="permanent_create_confirm"),
@@ -2447,7 +2717,7 @@ async def admin_permanent_create_confirm(callback: CallbackQuery, state: FSMCont
             f"👤 Пользователь: ID {user_id}\n"
             f"🪑 Место: №{place_id}\n"
             f"📅 Дни: {days_text}\n\n"
-            f"Автоматически созданы брони на ближайшие 60 дней.",
+            f"Автоматически созданы брони на ближайшие 90 дней.",
             parse_mode="HTML"
         )
     else:
@@ -2455,7 +2725,7 @@ async def admin_permanent_create_confirm(callback: CallbackQuery, state: FSMCont
             "❌ <b>Ошибка при создании постоянной брони</b>\n\n"
             "Возможные причины:\n"
             "• У этого пользователя уже есть постоянная бронь на это место\n"
-            "• Другой пользователь уже забронировал это место на пересекающиеся дни\n"
+            "• Другой пользователь уже забронировал это место на пересекающиеся дни недели\n"
             "• Место уже занято на выбранные дни недели\n\n"
             "Проверьте существующие постоянные брони через меню.",
             parse_mode="HTML"
@@ -2641,6 +2911,307 @@ async def admin_delete_permanent_confirm(callback: CallbackQuery, state: FSMCont
 
     await state.clear()
     await callback.answer()
+
+
+# НОВАЯ ФУНКЦИЯ: Продление постоянной брони
+@router.callback_query(F.data == "admin_extend_permanent")
+async def admin_extend_permanent_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "🔄 <b>Продление постоянной брони</b>\n\n"
+        "Введите Telegram ID или @username пользователя:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.extend_permanent_user)
+    await callback.answer()
+
+
+@router.message(AdminStates.extend_permanent_user)
+async def admin_extend_permanent_select(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    identifier = message.text.strip()
+
+    try:
+        user_id = int(identifier)
+    except ValueError:
+        user_id = db.find_user_by_username(identifier)
+        if not user_id:
+            await message.answer("❌ Пользователь не найден.")
+            await state.clear()
+            return
+
+    permanent_bookings = db.get_permanent_bookings(user_id)
+
+    if not permanent_bookings:
+        await message.answer(f"У пользователя {user_id} нет постоянных броней.")
+        await state.clear()
+        return
+
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    # Показываем список постоянных броней для выбора
+    buttons = []
+    for pb in permanent_bookings:
+        days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+        buttons.append([InlineKeyboardButton(
+            text=f"{pb['place_name']} ({days_text})",
+            callback_data=f"extend_perm_{pb['id']}"
+        )])
+
+    await message.answer(
+        f"📌 <b>Постоянные брони пользователя {user_id}</b>\n\n"
+        "Выберите бронь для продления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminStates.extend_permanent_select)
+
+
+@router.callback_query(AdminStates.extend_permanent_select, F.data.startswith("extend_perm_"))
+async def admin_extend_permanent_show_details(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    permanent_id = int(callback.data.split("_")[2])
+
+    # Получаем детали брони
+    pb = db.get_permanent_booking_by_id(permanent_id)
+
+    if not pb:
+        await callback.answer("❌ Бронь не найдена", show_alert=True)
+        return
+
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    days_text = ", ".join([weekday_names[d] for d in sorted(pb['weekdays'])])
+
+    user_display = f"@{pb['username']}" if pb['username'] else pb['first_name']
+
+    # Сохраняем данные о брони
+    await state.update_data(
+        permanent_id=permanent_id,
+        current_place_id=pb['place_id'],
+        current_weekdays=pb['weekdays'],
+        user_id=pb['user_id']
+    )
+
+    await callback.message.edit_text(
+        f"🔄 <b>Продление постоянной брони</b>\n\n"
+        f"👤 Пользователь: {user_display}\n"
+        f"🪑 Место: {pb['place_name']}\n"
+        f"📅 Дни: {days_text}\n\n"
+        f"Старая бронь будет удалена, места освободятся.\n"
+        f"Будут созданы новые брони на 90 дней вперёд.\n\n"
+        f"Что хотите сделать?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Продлить без изменений", callback_data="extend_confirm_same")],
+            [InlineKeyboardButton(text="🔧 Изменить место или дни", callback_data="extend_edit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="extend_cancel")]
+        ]),
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+@router.callback_query(F.data == "extend_confirm_same")
+async def admin_extend_confirm_same(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    permanent_id = data.get('permanent_id')
+
+    success = db.extend_permanent_booking(permanent_id)
+
+    if success:
+        pb = db.get_permanent_bookings(data.get('user_id'))
+        if pb:
+            latest = pb[-1]  # Последняя созданная бронь
+            weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            days_text = ", ".join([weekday_names[d] for d in sorted(latest['weekdays'])])
+
+            await callback.message.edit_text(
+                f"✅ <b>Постоянная бронь продлена на 90 дней!</b>\n\n"
+                f"👤 Пользователь ID: {latest['user_id']}\n"
+                f"🪑 Место: {latest['place_name']}\n"
+                f"📅 Дни: {days_text}\n\n"
+                f"Старые брони отменены, места освобождены.\n"
+                f"Автоматически созданы новые брони на 90 дней.",
+                parse_mode="HTML"
+            )
+    else:
+        await callback.message.edit_text(
+            "❌ <b>Ошибка при продлении брони</b>\n\n"
+            "Возможные причины:\n"
+            "• Место уже занято на новые даты\n"
+            "• Конфликт с другими постоянными бронями",
+            parse_mode="HTML"
+        )
+
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(F.data == "extend_edit")
+async def admin_extend_edit_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+
+    # Показываем карту офиса
+    if os.path.exists(OFFICE_MAP_PATH):
+        try:
+            photo = FSInputFile(OFFICE_MAP_PATH)
+            await callback.message.answer_photo(
+                photo=photo,
+                caption="🗺️ Карта офиса\n\nВыберите новое место или оставьте текущее"
+            )
+        except Exception as e:
+            logger.error(f"Error sending office map: {e}")
+
+    # Показываем все места для выбора
+    all_places = list(range(1, TOTAL_PLACES + 1))
+
+    await callback.message.answer(
+        f"🪑 <b>Изменение места</b>\n\n"
+        f"Текущее место: №{data.get('current_place_id')}\n\n"
+        f"Выберите новое место или нажмите текущее чтобы оставить:",
+        reply_markup=get_places_keyboard(all_places),
+        parse_mode="HTML"
+    )
+
+    await state.set_state(AdminStates.extend_permanent_edit_place)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.extend_permanent_edit_days, F.data.startswith("weekday_"))
+async def admin_extend_edit_days_toggle(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    selected = data.get('selected_new_weekdays', data.get('current_weekdays', []))
+
+    action = callback.data.split("_")[1]
+
+    if action == "confirm":
+        if not selected:
+            await callback.answer("⚠️ Выберите хотя бы один день!", show_alert=True)
+            return
+
+        await state.update_data(new_weekdays=selected)
+
+        # Показываем подтверждение
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        days_text = ", ".join([weekday_names[d] for d in sorted(selected)])
+
+        new_place = data.get('new_place_id')
+        old_place = data.get('current_place_id')
+
+        place_text = f"№{new_place}" + (" (изменено)" if new_place != old_place else "")
+
+        await callback.message.edit_text(
+            f"🔄 <b>Подтверждение изменений</b>\n\n"
+            f"🪑 Место: {place_text}\n"
+            f"📅 Дни: {days_text}\n\n"
+            f"Старая бронь будет удалена, места освободятся.\n"
+            f"Будут созданы новые брони на 90 дней вперёд.\n\n"
+            f"Продлить с этими параметрами?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Продлить", callback_data="extend_confirm_edited"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="extend_cancel")
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+
+        await state.set_state(AdminStates.extend_permanent_confirm)
+        await callback.answer()
+        return
+
+    elif action == "cancel":
+        await callback.message.delete()
+        await callback.answer("Отменено")
+        await state.clear()
+        return
+
+    # Toggle день
+    try:
+        day = int(action)
+        if day in selected:
+            selected.remove(day)
+        else:
+            selected.append(day)
+
+        await state.update_data(selected_new_weekdays=selected)
+
+        await callback.message.edit_reply_markup(
+            reply_markup=get_weekday_keyboard(selected)
+        )
+        await callback.answer()
+    except:
+        await callback.answer()
+
+
+@router.callback_query(F.data == "extend_confirm_edited")
+async def admin_extend_confirm_edited(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    permanent_id = data.get('permanent_id')
+    new_place_id = data.get('new_place_id')
+    new_weekdays = data.get('new_weekdays')
+
+    success = db.extend_permanent_booking(permanent_id, new_place_id, new_weekdays)
+
+    if success:
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        days_text = ", ".join([weekday_names[d] for d in sorted(new_weekdays)])
+
+        await callback.message.edit_text(
+            f"✅ <b>Постоянная бронь продлена на 90 дней!</b>\n\n"
+            f"👤 Пользователь ID: {data.get('user_id')}\n"
+            f"🪑 Место: №{new_place_id}\n"
+            f"📅 Дни: {days_text}\n\n"
+            f"Старые брони отменены, места освобождены.\n"
+            f"Автоматически созданы новые брони на 90 дней.",
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ <b>Ошибка при продлении брони</b>\n\n"
+            "Возможные причины:\n"
+            "• Место уже занято на новые даты\n"
+            "• Конфликт с другими постоянными бронями\n"
+            "• Выбранные дни уже забронированы другим пользователем",
+            parse_mode="HTML"
+        )
+
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(F.data == "extend_cancel")
+async def admin_extend_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.delete()
+    await callback.answer("Продление отменено")
+    await state.clear()
 
 
 # Главная функция
